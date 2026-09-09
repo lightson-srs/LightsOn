@@ -1053,6 +1053,13 @@ String buildDefSlotJson(int roomIdx, int k, const String &dateStr,
   snprintf(s, 6, "%02d:%02d", d.sh, d.sm);
   snprintf(e, 6, "%02d:%02d", d.eh, d.em);
   bool hasCode = strlen(d.code) > 0;
+  // Per-INSTANCE id — distinct from defId (the link back to the definition).
+  // A new one every materialization, same as the PWA's materializeRecurringSlot
+  // (makeSlotId()) — identity resets daily by design, only defId is stable.
+  // dateStr+k is unique within this one rollover write (each def index k
+  // appears once per day), which is all the PWA's merge-by-id needs — it
+  // only ever compares ids within the same room's CURRENT /slots snapshot.
+  String idField    = ",\"id\":\"sl_" + dateStr + "_" + String(k) + "\"";
   String codeField  = hasCode ? (",\"code\":\"" + String(d.code) + "\"") : "";
   String bbField    = (strlen(d.bookedBy) > 0) ? (",\"bookedBy\":\"" + String(d.bookedBy) + "\"") : "";
   String phField    = (strlen(d.phone) > 0)    ? (",\"phone\":\"" + String(d.phone) + "\"") : "";
@@ -1070,7 +1077,7 @@ String buildDefSlotJson(int roomIdx, int k, const String &dateStr,
     // exact time unknown" — parseSlots only checks non-null.
     activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
   }
-  return "{\"s\":\"" + String(s) + "\",\"e\":\"" + String(e) + "\",\"recurring\":true" + defIdField +
+  return "{\"s\":\"" + String(s) + "\",\"e\":\"" + String(e) + "\",\"recurring\":true" + idField + defIdField +
     codeField + bbField + phField + daysField + ",\"date\":\"" + dateStr + "\"" + activatedField + activatedByField + "}";
 }
 
@@ -1155,9 +1162,16 @@ bool midnightRollover() {
             String startStr = tomorrowJson.substring(si + 5, si + 10);
             String endStr   = tomorrowJson.substring(ei + 5, ei + 10);
             if (!first) newTodayJson += ",";
-            // Preserve code + the booker's name/phone (see the recurring
+            // Preserve id + code + the booker's name/phone (see the recurring
             // loop above for why) — omit only activatedAt, and re-stamp
-            // date to today since this slot is leaving "tomorrow" now.
+            // date to today since this slot is leaving "tomorrow" now. This
+            // is the SAME slot (just relabeled to today), so its id must
+            // survive the move — dropping it would make the PWA's merge-by-id
+            // treat it as a brand-new slot instead of recognizing it, on the
+            // next push. Only a slot that somehow has no id yet (pre-dates
+            // the id field) gets a fresh one here.
+            String id2 = extractStringField(obj, "id");
+            String idField2 = (id2.length() > 0) ? (",\"id\":\"" + id2 + "\"") : (",\"id\":\"sl_" + getDateStr() + "_" + String(si) + "\"");
             String codeField2 = "", bookedByField2 = "", phoneField2 = "";
             String c2 = extractStringField(obj, "code");
             if (c2.length() > 0) codeField2 = ",\"code\":\"" + c2 + "\"";
@@ -1169,7 +1183,7 @@ bool midnightRollover() {
             // promotion; coded slot → null (re-activation required). Matches
             // the new activatedAt-only rule in parseSlots.
             String activatedField2 = (c2.length() > 0) ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
-            newTodayJson += "{\"s\":\"" + startStr + "\",\"e\":\"" + endStr + "\"" +
+            newTodayJson += "{\"s\":\"" + startStr + "\",\"e\":\"" + endStr + "\"" + idField2 +
               codeField2 + bookedByField2 + phoneField2 + ",\"date\":\"" + getDateStr() + "\"" + activatedField2 + "}";
             first = false;
           }
