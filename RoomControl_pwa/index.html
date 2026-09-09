@@ -557,6 +557,18 @@
         <button class="print-btn" onclick="printQR()" style="display:none" id="printQrBtn">🖨️ Print</button>
       </div>
     </div>
+    <div class="qr-section">
+      <div class="settings-title" style="padding:0 0 8px">Booking request page QR code</div>
+      <div id="qrHidden2" style="display:none">
+        <div class="qr-url" id="qrProfileName2" style="font-weight:600;color:var(--text);margin-bottom:4px"></div>
+        <div class="qr-box"><div id="qrCanvas2"></div></div>
+        <div class="qr-url" id="qrUrlText2"></div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="print-btn" onclick="showRequestQR()" id="showQrBtn2">🔍 Show QR code</button>
+        <button class="print-btn" onclick="printRequestQR()" style="display:none" id="printQrBtn2">🖨️ Print</button>
+      </div>
+    </div>
     <div class="settings-section">
       <div class="settings-title">Room names &amp; GPIO pins</div>
       <div class="settings-sub" style="padding:0 14px 8px">Used by the ESP32 firmware to know which pin controls each room</div>
@@ -664,6 +676,15 @@
       </div>
     </div>
   </div>
+
+  <!-- Booking Requests (from the public request.html page) -->
+  <div class="page" id="page-requests">
+    <div class="settings-section">
+      <div class="settings-title">Booking requests</div>
+      <div class="settings-sub" style="padding:0 14px 8px">Today and tomorrow only — anything older is cleared automatically when this tab opens.</div>
+      <div id="requestsList"></div>
+    </div>
+  </div>
 </div>
 
 <div class="bottom-nav">
@@ -674,6 +695,10 @@
   <button class="nav-btn" id="nav-timeline" onclick="showPage('timeline',this)">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
     Timeline
+  </button>
+  <button class="nav-btn" id="nav-requests" onclick="showPage('requests',this)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+    Requests
   </button>
   <button class="nav-btn" id="nav-settings" onclick="showPage('settings',this)">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -2377,6 +2402,206 @@ function showQR() {
     };
     tryGenerate();
   }
+}
+
+// Booking-request page QR — same lazy-generate-once pattern as showQR(),
+// just a separate flag/target so switching between the two QR sections
+// doesn't skip regenerating the one not yet shown.
+let reqQrGenerated = false;
+
+function showRequestQR() {
+  const p = getActiveProfile();
+  if (!p.dbUrl) { showToast('Set this profile\'s Database URL first, then Show QR'); return; }
+  if (!p.fbNum) { showToast('Save this profile first — its Firebase number hasn\'t been assigned yet'); return; }
+  const baseUrl = window.location.href
+    .replace('index.html', '')
+    .replace(/\/$/, '');
+  const requestUrl = baseUrl + '/request.html?db=' + encodeURIComponent(p.dbUrl) + '&p=' + p.fbNum;
+
+  document.getElementById('qrHidden2').style.display = 'block';
+  document.getElementById('showQrBtn2').style.display = 'none';
+  document.getElementById('printQrBtn2').style.display = 'block';
+  document.getElementById('qrProfileName2').textContent = p.name;
+  document.getElementById('qrUrlText2').textContent = requestUrl;
+
+  if (!reqQrGenerated) {
+    document.getElementById('qrCanvas2').innerHTML = '';
+    const tryGenerate = () => {
+      if (typeof QRCode === 'undefined') {
+        document.getElementById('qrCanvas2').innerHTML =
+          '<div style="color:var(--muted);font-size:12px;padding:10px">Loading QR library…</div>';
+        setTimeout(tryGenerate, 500);
+        return;
+      }
+      try {
+        document.getElementById('qrCanvas2').innerHTML = '';
+        new QRCode(document.getElementById('qrCanvas2'), {
+          text: requestUrl,
+          width: 160, height: 160,
+          colorDark: '#000000',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.M
+        });
+        reqQrGenerated = true;
+      } catch(e) {
+        document.getElementById('qrCanvas2').innerHTML =
+          '<div style="color:var(--red);font-size:12px;padding:10px">QR library not loaded.<br>Check internet connection.</div>';
+      }
+    };
+    tryGenerate();
+  }
+}
+
+function printRequestQR() {
+  const p = getActiveProfile();
+  if (!p.dbUrl) { showToast('Set this profile\'s Database URL first'); return; }
+  if (!p.fbNum) { showToast('Save this profile first — its Firebase number hasn\'t been assigned yet'); return; }
+  const baseUrl = window.location.href.replace('index.html','').replace(/\/$/, '');
+  const requestUrl = baseUrl + '/request.html?db=' + encodeURIComponent(p.dbUrl) + '&p=' + p.fbNum;
+  const win = window.open('', '_blank');
+  const scriptTag = '<scr' + 'ipt src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></' + 'script>';
+  const inlineScript = '<scr' + 'ipt>window.onload=function(){new QRCode(document.getElementById("qr"),{text:"' + requestUrl + '",width:280,height:280,colorDark:"#000000",colorLight:"#ffffff",correctLevel:2});setTimeout(function(){window.print();},800);};</' + 'script>';
+  const productFooterHtml =
+    '<div style="margin-top:24px;font-size:12px;color:#999;line-height:1.6">' +
+    '<strong style="color:#666">' + PRODUCT_INFO.name + '</strong> — ' + PRODUCT_INFO.tagline + '<br>' +
+    PRODUCT_INFO.phone + ' &middot; ' + PRODUCT_INFO.email +
+    '</div>';
+  win.document.write(
+    '<!DOCTYPE html><html><head><title>' + PRODUCT_INFO.name + ' QR</title>' +
+    '<style>body{font-family:-apple-system,sans-serif;text-align:center;padding:40px;}' +
+    'h2{font-size:22px;margin-bottom:4px;}p{color:#666;font-size:14px;margin-bottom:20px;}' +
+    '@media print{button{display:none;}}</style>' +
+    scriptTag +
+    '</head><body>' +
+    '<h2>' + PRODUCT_INFO.name + ' — ' + p.name + '</h2>' +
+    '<p>Scan to request a booking</p>' +
+    '<div id="qr" style="display:inline-block;background:white;padding:12px;border:1px solid #ddd;border-radius:8px"></div>' +
+    productFooterHtml +
+    '<br><button onclick="window.print()">Print</button>' +
+    inlineScript +
+    '\n</body></html>'
+  );
+  win.document.close();
+}
+
+// ── Booking requests (from the public request.html page) ─────────────
+// /requests/{id} is written by request.html with no login — this is the
+// admin side: list, purge stale ones, convert to a real slot, or dismiss.
+let requestsCache = {}; // id -> request object, refreshed each renderRequests()
+
+async function renderRequests() {
+  const container = document.getElementById('requestsList');
+  container.innerHTML = '<div class="settings-sub" style="padding:10px 14px">Loading…</div>';
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl) { container.innerHTML = '<div class="settings-sub" style="padding:10px 14px">Set a Firebase URL in Settings first.</div>'; return; }
+
+  const data = await fbGet('/requests', p);
+  requestsCache = (data && typeof data === 'object') ? data : {};
+
+  // Purge anything dated before today — regardless of status. Only ever
+  // reached when this tab is opened, not on every app load, so it doesn't
+  // add extra Firebase traffic to routine dashboard use.
+  const today = todayStr();
+  const staleIds = Object.keys(requestsCache).filter(id => {
+    const r = requestsCache[id];
+    return !r || !r.date || r.date < today;
+  });
+  if (staleIds.length > 0) {
+    await Promise.all(staleIds.map(id => fbSet(`/requests/${id}`, null, p)));
+    staleIds.forEach(id => delete requestsCache[id]);
+  }
+
+  const ids = Object.keys(requestsCache);
+  if (ids.length === 0) {
+    container.innerHTML = '<div class="settings-sub" style="padding:10px 14px">No booking requests for today or tomorrow.</div>';
+    return;
+  }
+
+  // Today's first, then tomorrow's; within each, earliest start time first.
+  ids.sort((a, b) => {
+    const ra = requestsCache[a], rb = requestsCache[b];
+    if (ra.date !== rb.date) return ra.date < rb.date ? -1 : 1;
+    return (ra.s || '').localeCompare(rb.s || '');
+  });
+
+  container.innerHTML = ids.map(id => {
+    const r = requestsCache[id];
+    const isConfirmed = r.status === 'confirmed';
+    const dayLabel = r.date === today ? 'Today' : 'Tomorrow';
+    const statusBadge = isConfirmed
+      ? '<span class="status-msg ok" style="display:inline-block;margin:0">✓ Confirmed</span>'
+      : '<span class="status-msg" style="display:inline-block;margin:0;background:rgba(240,160,48,0.15);color:#f0a030">⏳ Open</span>';
+    return `<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding:12px 14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <div style="font-weight:600">${r.roomName || ('Room ' + r.roomId)} · ${r.s} – ${r.e} <span style="color:var(--muted);font-weight:400">(${dayLabel})</span></div>
+        ${statusBadge}
+      </div>
+      <div style="color:var(--muted);font-size:13px">${r.name || ''} · <a href="tel:${r.phone||''}" style="color:var(--accent);text-decoration:none">${r.phone||''}</a></div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        ${isConfirmed ? '' : `<button class="save-btn" style="margin:0;flex:1" onclick="convertRequest('${id}')">✓ Confirm booking</button>`}
+        <button class="profile-btn" onclick="dismissRequest('${id}')" title="Dismiss">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// One click: creates a real, coded one-time slot in the requested room/day
+// using the request's own time verbatim (no editing step), then marks the
+// request confirmed and linked to that slot.
+async function convertRequest(id) {
+  if (!requireLicense('convert a booking request')) return;
+  const req = requestsCache[id];
+  if (!req) { showToast('Request not found — try reloading this tab'); return; }
+  const room = state.rooms.find(r => r.id === req.roomId);
+  if (!room) { showToast('That room no longer exists'); return; }
+  const dayIdx = (req.date === todayStr()) ? 0 : (req.date === tomorrowDateStr() ? 1 : null);
+  if (dayIdx === null) { showToast('This request is no longer for today or tomorrow'); return; }
+
+  if (!room.slots[dayIdx]) room.slots[dayIdx] = [];
+  const existing = normalizeSlots(room.slots[dayIdx]);
+  if (existing.some(sl => sl.s === req.s && sl.e === req.e)) {
+    showToast('⚠️ That room already has a slot at this time — dismiss or resolve manually');
+    return;
+  }
+
+  const newSlot = {
+    id: makeSlotId(),
+    s: req.s, e: req.e, recurring: false,
+    code: generate4DigitCode(),
+    paid: false,
+    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
+    _fresh: true,
+    date: req.date,
+    bookedBy: req.name || null,
+    phone: req.phone || null
+  };
+  room.slots[dayIdx].push(newSlot);
+
+  markRoomDirty(room.id - 1);
+  persist();
+  const p = getActiveProfile();
+  await pushRoom(room.id - 1, p);
+  await fbPatch(`/requests/${id}`, {
+    status: 'confirmed',
+    confirmedAt: Date.now(),
+    confirmedRoomId: room.id,
+    confirmedSlotId: newSlot.id
+  }, p);
+
+  showToast(`✓ Booking confirmed for ${room.name}`);
+  renderDashboard();
+  refreshTimelineIfVisible();
+  renderRequests();
+}
+
+async function dismissRequest(id) {
+  if (!requireLicense('dismiss a booking request')) return;
+  if (!confirm('Delete this booking request? This cannot be undone.')) return;
+  const p = getActiveProfile();
+  await fbSet(`/requests/${id}`, null, p);
+  delete requestsCache[id];
+  showToast('Request dismissed');
+  renderRequests();
 }
 
 function printQR() {
@@ -4696,6 +4921,10 @@ function resetConnectionForProfileChange() {
   document.getElementById('qrHidden').style.display = 'none';
   document.getElementById('showQrBtn').style.display = 'block';
   document.getElementById('printQrBtn').style.display = 'none';
+  reqQrGenerated = false;
+  document.getElementById('qrHidden2').style.display = 'none';
+  document.getElementById('showQrBtn2').style.display = 'block';
+  document.getElementById('printQrBtn2').style.display = 'none';
 }
 
 async function saveActiveProfile() {
@@ -5158,6 +5387,7 @@ function showPage(name, btn) {
   if (name === 'timeline')  renderTimeline();
   if (name === 'settings')  renderSettings();
   if (name === 'import')    renderImportPage();
+  if (name === 'requests')  renderRequests();
 }
 
 // ── Toast ─────────────────────────────────────────────────────
