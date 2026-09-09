@@ -2537,10 +2537,18 @@ async function renderRequests() {
     const badges = {
       confirmed: '<span class="status-msg ok" style="display:inline-block;margin:0">✓ Confirmed</span>',
       declined:  '<span class="status-msg err" style="display:inline-block;margin:0">✗ Declined</span>',
-      open:      '<span class="status-msg" style="display:inline-block;margin:0;background:rgba(240,160,48,0.15);color:#f0a030">⏳ Open</span>'
+      open:      '<span class="status-msg" style="display:inline-block;margin:0;background:rgba(240,160,48,0.15);color:#f0a030">⏳ Open</span>',
+      taken:     '<span class="status-msg err" style="display:inline-block;margin:0">⚠ Slot taken</span>'
     };
-    const status = (r.status === 'confirmed' || r.status === 'declined') ? r.status : 'open';
+    let status = (r.status === 'confirmed' || r.status === 'declined') ? r.status : 'open';
+    // An open request whose exact room+date+time is already occupied — by a
+    // direct admin booking, not necessarily this request's own conversion —
+    // can never be one-click-confirmed. Surface that up front instead of only
+    // discovering it when Confirm is tapped and fails.
+    if (status === 'open' && isSlotTaken(r)) status = 'taken';
     const dayLabel = r.date === today ? 'Today' : 'Tomorrow';
+    const showConfirm = status === 'open';
+    const showEdit = status === 'open' || status === 'taken';
     return `<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding:12px 14px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
         <div style="font-weight:600">${r.roomName || ('Room ' + r.roomId)} · ${r.s} – ${r.e} <span style="color:var(--muted);font-weight:400">(${dayLabel})</span></div>
@@ -2548,11 +2556,24 @@ async function renderRequests() {
       </div>
       <div style="color:var(--muted);font-size:13px">${r.name || ''} · <a href="tel:${r.phone||''}" style="color:var(--accent);text-decoration:none">${r.phone||''}</a></div>
       <div style="display:flex;gap:8px;margin-top:4px">
-        ${status === 'open' ? `<button class="save-btn" style="margin:0;flex:1" onclick="convertRequest('${id}')">✓ Confirm booking</button>` : ''}
+        ${showConfirm ? `<button class="save-btn" style="margin:0;flex:1" onclick="convertRequest('${id}')">✓ Confirm booking</button>` : ''}
+        ${showEdit ? `<button class="test-btn" style="margin:0;flex:1" onclick="openEditRequestModal('${id}')">✎ Edit &amp; Confirm</button>` : ''}
         <button class="profile-btn" onclick="dismissRequest('${id}')" title="Dismiss">🗑</button>
       </div>
     </div>`;
   }).join('');
+}
+
+// True when this room already has a slot at this exact date/start/end —
+// e.g. the admin booked it directly (not via this request) while the
+// request sat open. A stale/missing room or a request no longer dated
+// today/tomorrow also counts as "taken" (nothing to confirm it against).
+function isSlotTaken(req) {
+  const room = state.rooms.find(r => r.id === req.roomId);
+  if (!room) return true;
+  const dayIdx = (req.date === todayStr()) ? 0 : (req.date === tomorrowDateStr() ? 1 : null);
+  if (dayIdx === null) return true;
+  return normalizeSlots(room.slots[dayIdx]).some(sl => sl.s === req.s && sl.e === req.e);
 }
 
 // Once a specific room+date+time is booked (by any means — admin convert
@@ -2576,10 +2597,45 @@ async function declineSiblingRequests(confirmedReq, excludeId, p) {
   await Promise.all(jobs);
 }
 
-// One click: creates a real, coded one-time slot in the requested room/day
-// using the request's own time verbatim (no editing step), then marks the
-// request confirmed and linked to that slot, and declines any other open
-// request for that exact same room/date/time.
+// Shared by the one-click Confirm and the Edit & Confirm modal: creates a
+// real, coded one-time slot for room/dayIdx/date/s/e, marks the request
+// confirmed and linked to it, and declines any other open request for that
+// exact final room/date/time. Returns {ok:false} without changing anything
+// if that room/time is already occupied — caller decides how to surface it.
+async function bookSlotForRequest(id, req, room, dayIdx, date, s, e, p) {
+  if (!room.slots[dayIdx]) room.slots[dayIdx] = [];
+  const existing = normalizeSlots(room.slots[dayIdx]);
+  if (existing.some(sl => sl.s === s && sl.e === e)) return { ok: false };
+
+  const newSlot = {
+    id: makeSlotId(),
+    s, e, recurring: false,
+    code: generate4DigitCode(),
+    paid: false,
+    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
+    _fresh: true,
+    date,
+    bookedBy: req.name || null,
+    phone: req.phone || null
+  };
+  room.slots[dayIdx].push(newSlot);
+
+  markRoomDirty(room.id - 1);
+  persist();
+  await pushRoom(room.id - 1, p);
+  await fbPatch(`/requests/${id}`, {
+    status: 'confirmed',
+    confirmedAt: Date.now(),
+    confirmedRoomId: room.id,
+    confirmedSlotId: newSlot.id
+  }, p);
+  await declineSiblingRequests({ roomId: room.id, date, s, e }, id, p);
+
+  return { ok: true, room, slot: newSlot };
+}
+
+// One click: books using the request's own room/date/time verbatim, no
+// editing step.
 async function convertRequest(id) {
   if (!requireLicense('convert a booking request')) return;
   const req = requestsCache[id];
@@ -2589,39 +2645,74 @@ async function convertRequest(id) {
   const dayIdx = (req.date === todayStr()) ? 0 : (req.date === tomorrowDateStr() ? 1 : null);
   if (dayIdx === null) { showToast('This request is no longer for today or tomorrow'); return; }
 
-  if (!room.slots[dayIdx]) room.slots[dayIdx] = [];
-  const existing = normalizeSlots(room.slots[dayIdx]);
-  if (existing.some(sl => sl.s === req.s && sl.e === req.e)) {
-    showToast('⚠️ That room already has a slot at this time — dismiss or resolve manually');
+  const p = getActiveProfile();
+  const result = await bookSlotForRequest(id, req, room, dayIdx, req.date, req.s, req.e, p);
+  if (!result.ok) {
+    showToast('⚠️ That room already has a slot at this time — use Edit & Confirm to pick another');
     return;
   }
 
-  const newSlot = {
-    id: makeSlotId(),
-    s: req.s, e: req.e, recurring: false,
-    code: generate4DigitCode(),
-    paid: false,
-    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
-    _fresh: true,
-    date: req.date,
-    bookedBy: req.name || null,
-    phone: req.phone || null
-  };
-  room.slots[dayIdx].push(newSlot);
+  showToast(`✓ Booking confirmed for ${result.room.name}`);
+  renderDashboard();
+  refreshTimelineIfVisible();
+  renderRequests();
+}
 
-  markRoomDirty(room.id - 1);
-  persist();
+// ── Edit & Confirm modal — adjust room/day/time before booking ─────────
+let editReqId = null;
+let editReqDay = 0;
+
+function editReqModalBackdropClick(e) { if (e.target.id === 'editRequestModal') closeEditRequestModal(); }
+
+function openEditRequestModal(id) {
+  if (!requireLicense('edit and confirm a booking request')) return;
+  const req = requestsCache[id];
+  if (!req) { showToast('Request not found — try reloading this tab'); return; }
+  editReqId = id;
+  const sel = document.getElementById('reqEditRoom');
+  sel.innerHTML = state.rooms.map(r => `<option value="${r.id}" ${r.id === req.roomId ? 'selected' : ''}>${r.name}</option>`).join('');
+  setReqEditDay(req.date === todayStr() ? 0 : 1);
+  document.getElementById('reqEditStart').value = req.s;
+  document.getElementById('reqEditEnd').value = req.e;
+  document.getElementById('reqEditError').style.display = 'none';
+  document.getElementById('editRequestModal').classList.add('show');
+}
+
+function setReqEditDay(day) {
+  editReqDay = day;
+  document.getElementById('reqEditDayToday').className = 'ov-btn' + (day === 0 ? ' active-auto' : '');
+  document.getElementById('reqEditDayTomorrow').className = 'ov-btn' + (day === 1 ? ' active-auto' : '');
+}
+
+function closeEditRequestModal() {
+  document.getElementById('editRequestModal').classList.remove('show');
+  editReqId = null;
+}
+
+function showEditReqError(msg) {
+  const el = document.getElementById('reqEditError');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+async function saveEditedRequest() {
+  const id = editReqId;
+  const req = requestsCache[id];
+  if (!req) return;
+  const roomId = parseInt(document.getElementById('reqEditRoom').value, 10);
+  const room = state.rooms.find(r => r.id === roomId);
+  if (!room) { showEditReqError('Room not found'); return; }
+  const s = document.getElementById('reqEditStart').value;
+  const e = document.getElementById('reqEditEnd').value;
+  if (!s || !e || s >= e) { showEditReqError('Invalid time range'); return; }
+  const date = editReqDay === 0 ? todayStr() : tomorrowDateStr();
+
   const p = getActiveProfile();
-  await pushRoom(room.id - 1, p);
-  await fbPatch(`/requests/${id}`, {
-    status: 'confirmed',
-    confirmedAt: Date.now(),
-    confirmedRoomId: room.id,
-    confirmedSlotId: newSlot.id
-  }, p);
-  await declineSiblingRequests(req, id, p);
+  const result = await bookSlotForRequest(id, req, room, editReqDay, date, s, e, p);
+  if (!result.ok) { showEditReqError('⚠️ That room already has a slot at this time — pick another'); return; }
 
-  showToast(`✓ Booking confirmed for ${room.name}`);
+  closeEditRequestModal();
+  showToast(`✓ Booking confirmed for ${result.room.name}`);
   renderDashboard();
   refreshTimelineIfVisible();
   renderRequests();
@@ -5881,6 +5972,38 @@ function applyUpdate() {
         <button class="modal-save-btn" onclick="payChoiceSelect('send')">✓ Confirm &amp; Send WhatsApp</button>
         <button class="modal-cancel-btn" onclick="payChoiceSelect('update')">Update only (no message)</button>
         <button class="modal-cancel-btn" onclick="payChoiceSelect('cancel')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Edit & Confirm booking request modal ─────────────────── -->
+  <div class="modal-overlay" id="editRequestModal" onclick="editReqModalBackdropClick(event)">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">Edit &amp; Confirm Booking</span>
+        <button class="modal-close" onclick="closeEditRequestModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-row">
+          <div class="modal-label">Room</div>
+          <select class="modal-time" id="reqEditRoom" style="flex:1"></select>
+        </div>
+        <div class="modal-adjust-row">
+          <button class="ov-btn" id="reqEditDayToday" onclick="setReqEditDay(0)">Today</button>
+          <button class="ov-btn" id="reqEditDayTomorrow" onclick="setReqEditDay(1)">Tomorrow</button>
+        </div>
+        <div class="modal-row">
+          <div class="modal-label">Start</div>
+          <input class="modal-time" type="time" id="reqEditStart">
+        </div>
+        <div class="modal-row">
+          <div class="modal-label">End</div>
+          <input class="modal-time" type="time" id="reqEditEnd">
+        </div>
+        <div class="status-msg err" id="reqEditError" style="display:none"></div>
+        <div class="modal-divider"></div>
+        <button class="modal-save-btn" onclick="saveEditedRequest()">✓ Confirm booking</button>
+        <button class="modal-cancel-btn" onclick="closeEditRequestModal()">Cancel</button>
       </div>
     </div>
   </div>
