@@ -520,6 +520,14 @@
         <input class="settings-input" id="cfg-activate-window" type="number" min="0" placeholder="4" style="font-family:monospace;max-width:120px">
       </div>
     </div>
+    <div class="settings-section">
+      <div class="settings-title">Booking requests</div>
+      <div class="settings-sub" style="padding:0 14px 8px">Controls the public booking-request page (Settings → Booking request page QR code).</div>
+      <div class="settings-row">
+        <div class="settings-label">Auto-approve requests<div class="settings-sub">Off = every request waits in the Requests tab for you to confirm. On = a request is checked against current availability and confirmed immediately, with no review step.</div></div>
+        <input type="checkbox" id="cfg-auto-approve" style="width:20px;height:20px;accent-color:var(--accent)">
+      </div>
+    </div>
     <div class="settings-section admin-exempt">
       <div class="settings-title">End-of-slot warning</div>
       <div class="settings-sub admin-only" style="padding:0 14px 8px">A single shared beeper sounds one short beep when any room's active slot is a few minutes from ending, and that room's own LED starts blinking for the rest of the window. Leave both blank to disable — existing setups are unaffected. Applied to this profile's Firebase; the ESP32 needs a reboot to pick up a pin change.</div>
@@ -2526,28 +2534,52 @@ async function renderRequests() {
 
   container.innerHTML = ids.map(id => {
     const r = requestsCache[id];
-    const isConfirmed = r.status === 'confirmed';
+    const badges = {
+      confirmed: '<span class="status-msg ok" style="display:inline-block;margin:0">✓ Confirmed</span>',
+      declined:  '<span class="status-msg err" style="display:inline-block;margin:0">✗ Declined</span>',
+      open:      '<span class="status-msg" style="display:inline-block;margin:0;background:rgba(240,160,48,0.15);color:#f0a030">⏳ Open</span>'
+    };
+    const status = (r.status === 'confirmed' || r.status === 'declined') ? r.status : 'open';
     const dayLabel = r.date === today ? 'Today' : 'Tomorrow';
-    const statusBadge = isConfirmed
-      ? '<span class="status-msg ok" style="display:inline-block;margin:0">✓ Confirmed</span>'
-      : '<span class="status-msg" style="display:inline-block;margin:0;background:rgba(240,160,48,0.15);color:#f0a030">⏳ Open</span>';
     return `<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding:12px 14px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
         <div style="font-weight:600">${r.roomName || ('Room ' + r.roomId)} · ${r.s} – ${r.e} <span style="color:var(--muted);font-weight:400">(${dayLabel})</span></div>
-        ${statusBadge}
+        ${badges[status]}
       </div>
       <div style="color:var(--muted);font-size:13px">${r.name || ''} · <a href="tel:${r.phone||''}" style="color:var(--accent);text-decoration:none">${r.phone||''}</a></div>
       <div style="display:flex;gap:8px;margin-top:4px">
-        ${isConfirmed ? '' : `<button class="save-btn" style="margin:0;flex:1" onclick="convertRequest('${id}')">✓ Confirm booking</button>`}
+        ${status === 'open' ? `<button class="save-btn" style="margin:0;flex:1" onclick="convertRequest('${id}')">✓ Confirm booking</button>` : ''}
         <button class="profile-btn" onclick="dismissRequest('${id}')" title="Dismiss">🗑</button>
       </div>
     </div>`;
   }).join('');
 }
 
+// Once a specific room+date+time is booked (by any means — admin convert
+// or the public page's auto-approve), every OTHER still-open request for
+// that exact same slot can never be honoured too — decline them so they
+// don't sit in the list looking actionable. excludeId is the request that
+// was just confirmed (or is being confirmed inline), so it's never
+// declined by its own conversion.
+async function declineSiblingRequests(confirmedReq, excludeId, p) {
+  const data = await fbGet('/requests', p);
+  if (!data || typeof data !== 'object') return;
+  const jobs = Object.keys(data)
+    .filter(rid => rid !== excludeId)
+    .filter(rid => {
+      const r = data[rid];
+      return r && r.status !== 'confirmed' && r.status !== 'declined' &&
+        r.roomId === confirmedReq.roomId && r.date === confirmedReq.date &&
+        r.s === confirmedReq.s && r.e === confirmedReq.e;
+    })
+    .map(rid => fbPatch(`/requests/${rid}`, { status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }, p));
+  await Promise.all(jobs);
+}
+
 // One click: creates a real, coded one-time slot in the requested room/day
 // using the request's own time verbatim (no editing step), then marks the
-// request confirmed and linked to that slot.
+// request confirmed and linked to that slot, and declines any other open
+// request for that exact same room/date/time.
 async function convertRequest(id) {
   if (!requireLicense('convert a booking request')) return;
   const req = requestsCache[id];
@@ -2587,6 +2619,7 @@ async function convertRequest(id) {
     confirmedRoomId: room.id,
     confirmedSlotId: newSlot.id
   }, p);
+  await declineSiblingRequests(req, id, p);
 
   showToast(`✓ Booking confirmed for ${room.name}`);
   renderDashboard();
@@ -3224,6 +3257,7 @@ async function pullConfigFromFirebase(p) {
     const awh = (cfg.activateWindowHours === null || cfg.activateWindowHours === undefined || cfg.activateWindowHours === '') ? null : Math.max(0, parseInt(cfg.activateWindowHours, 10) || 0);
     setIf('activateWindowHours', awh);
   }
+  if ('autoApproveBookings' in cfg) setIf('autoApproveBookings', !!cfg.autoApproveBookings);
   if ('beeperPin' in cfg)    setIf('beeperPin',    numOrNull(cfg.beeperPin));
   if ('warnMinutes' in cfg)  setIf('warnMinutes',  numOrNull(cfg.warnMinutes));
   if ('beepMs' in cfg)       setIf('beepMs',       numOrNull(cfg.beepMs));
@@ -4037,9 +4071,35 @@ async function addSlot(id) {
 async function deleteSlot(id, idx) {
   if (!requireLicense('delete a slot')) return;
   const r = state.rooms.find(x => x.id === id);
+  const deletedSlot = normalizeSlots(r.slots[state.schedDay])[idx];
   r.slots[state.schedDay].splice(idx, 1);
   markRoomDirty(id-1);
   persist(); await pushRoom(id-1); renderDashboard(); refreshTimelineIfVisible();
+  if (deletedSlot && deletedSlot.id) await revertRequestForDeletedSlot(id, deletedSlot.id, getActiveProfile());
+}
+
+// Deleting a slot that came from a confirmed booking request leaves that
+// request pointing at a slot that no longer exists. Put it back to "open"
+// so it's visible/actionable in the Requests tab again — this is a plain
+// status revert, NOT a re-run of any booking/auto-approve workflow, so it
+// never creates a new slot or touches any other request on its own.
+async function revertRequestForDeletedSlot(roomId, slotId, p) {
+  const data = await fbGet('/requests', p);
+  if (!data || typeof data !== 'object') return;
+  const matchId = Object.keys(data).find(rid => {
+    const r = data[rid];
+    return r && r.status === 'confirmed' && r.confirmedRoomId === roomId && r.confirmedSlotId === slotId;
+  });
+  if (!matchId) return;
+  await fbPatch(`/requests/${matchId}`, {
+    status: 'open',
+    confirmedRoomId: null,
+    confirmedSlotId: null,
+    confirmedAt: null,
+    revertedAt: Date.now(),
+    revertedReason: 'slot_deleted'
+  }, p);
+  if (requestsCache[matchId]) requestsCache[matchId] = { ...requestsCache[matchId], status: 'open', confirmedRoomId: null, confirmedSlotId: null, confirmedAt: null };
 }
 
 function toggleDay(id, day) {
@@ -4757,6 +4817,7 @@ function renderSettings() {
   document.getElementById('cfg-emergency-pin').value = (p.emergencyPin === null || p.emergencyPin === undefined) ? '' : p.emergencyPin;
   document.getElementById('cfg-emergency-timeout').value = (p.emergencyTimeout === null || p.emergencyTimeout === undefined) ? '' : p.emergencyTimeout;
   document.getElementById('cfg-activate-window').value = (p.activateWindowHours === null || p.activateWindowHours === undefined) ? '' : p.activateWindowHours;
+  document.getElementById('cfg-auto-approve').checked = !!p.autoApproveBookings;
   document.getElementById('cfg-beeper-pin').value = (p.beeperPin === null || p.beeperPin === undefined) ? '' : p.beeperPin;
   document.getElementById('cfg-warn-minutes').value = (p.warnMinutes === null || p.warnMinutes === undefined) ? '' : p.warnMinutes;
   document.getElementById('cfg-beep-ms').value = (p.beepMs === null || p.beepMs === undefined) ? '' : p.beepMs;
@@ -4955,6 +5016,7 @@ async function saveActiveProfile() {
   const activateWindowRaw = document.getElementById('cfg-activate-window').value.trim();
   const activateWindowVal = parseInt(activateWindowRaw, 10);
   p.activateWindowHours = activateWindowRaw === '' || isNaN(activateWindowVal) || activateWindowVal < 0 ? null : activateWindowVal;
+  p.autoApproveBookings = document.getElementById('cfg-auto-approve').checked;
   const beeperPinVal = document.getElementById('cfg-beeper-pin').value.trim();
   p.beeperPin = beeperPinVal === '' ? null : parseInt(beeperPinVal, 10);
   // Blank or 0 (or anything non-positive) disables the warning — store null
@@ -5056,6 +5118,7 @@ function finishSaveSettings(p, message) {
     fbSet('/config/emergencyPin', p.emergencyPin === null || p.emergencyPin === undefined ? null : p.emergencyPin, p);
     fbSet('/config/emergencyTimeout', p.emergencyTimeout === null || p.emergencyTimeout === undefined ? null : p.emergencyTimeout, p);
     fbSet('/config/activateWindowHours', p.activateWindowHours === null || p.activateWindowHours === undefined ? null : p.activateWindowHours, p);
+    fbSet('/config/autoApproveBookings', !!p.autoApproveBookings, p);
     fbSet('/config/beeperPin', p.beeperPin === null || p.beeperPin === undefined ? null : p.beeperPin, p);
     fbSet('/config/warnMinutes', p.warnMinutes === null || p.warnMinutes === undefined ? null : p.warnMinutes, p);
     fbSet('/config/beepMs', p.beepMs === null || p.beepMs === undefined ? null : p.beepMs, p);
@@ -5247,6 +5310,7 @@ function restoreFromFile(event) {
         if (!('emergencyPin' in p)) p.emergencyPin = null;
         if (!('emergencyTimeout' in p)) p.emergencyTimeout = null;
         if (!('activateWindowHours' in p)) p.activateWindowHours = null;
+        if (!('autoApproveBookings' in p)) p.autoApproveBookings = false;
         if (!('beeperPin' in p))    p.beeperPin = null;
         // warn/beep default to sensible values (not null) for old backups that
         // predate these fields — matches the new-profile defaults.

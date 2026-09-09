@@ -309,6 +309,73 @@ function closeForm() {
   selectedOption = null;
 }
 
+function makeSlotId() {
+  return 'sl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function generate4DigitCode() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
+// Once a specific room+date+time is booked, every OTHER still-open request
+// for that exact same slot can never be honoured — decline them so they
+// don't linger looking actionable in the admin's Requests tab. Mirrors
+// index.html's declineSiblingRequests; duplicated here (rather than shared)
+// since this page has no access to index.html's fbPatch helper — merges the
+// change onto the full fetched object itself before writing it back with
+// fbPut (a plain PUT, unlike fbPatch, replaces the whole node).
+async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
+  const data = await fbGet('/requests');
+  if (!data || typeof data !== 'object') return;
+  const jobs = Object.keys(data)
+    .filter(rid => rid !== excludeId)
+    .filter(rid => {
+      const r = data[rid];
+      return r && r.status !== 'confirmed' && r.status !== 'declined' &&
+        r.roomId === confirmedReq.roomId && r.date === confirmedReq.date &&
+        r.s === confirmedReq.s && r.e === confirmedReq.e;
+    })
+    .map(rid => fbPut('/requests/' + rid, { ...data[rid], status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }));
+  await Promise.all(jobs);
+}
+
+// Called only when /config/autoApproveBookings is true. Re-checks
+// availability right before writing (someone may have booked this exact
+// time in the moments since the page loaded), then creates the slot at a
+// fresh index — a targeted single-index PUT, never a wholesale overwrite of
+// the whole bucket, so it can never clobber a slot something else just
+// added to the same room. Returns true if it actually booked the slot;
+// false if the slot turned out to already be taken (request is declined
+// in that case, not left dangling as "open").
+async function tryAutoApprove(id, room, opt, reqObj) {
+  const bucketPath = '/rooms/room' + room.id + (opt.dayIdx === 0 ? '/slots' : '/slotsT');
+  const arr = normalizeArr(await fbGet(bucketPath));
+  const collision = arr.some(sl => sl && sl.s === opt.s && sl.e === opt.e);
+  if (collision) {
+    await fbPut('/requests/' + id, { ...reqObj, status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' });
+    return false;
+  }
+
+  const newSlot = {
+    id: makeSlotId(),
+    s: opt.s, e: opt.e, recurring: false,
+    code: generate4DigitCode(),
+    paid: false,
+    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
+    date: opt.date,
+    bookedBy: reqObj.name, phone: reqObj.phone,
+    slotTs: Date.now()
+  };
+  const ok = await fbPut(bucketPath + '/' + arr.length, newSlot);
+  if (!ok) return false;
+
+  await fbPut('/requests/' + id, {
+    ...reqObj, status: 'confirmed', confirmedAt: Date.now(),
+    confirmedRoomId: room.id, confirmedSlotId: newSlot.id
+  });
+  await declineSiblingRequestsPublic(reqObj, id);
+  return true;
+}
+
 async function submitRequest() {
   if (!selectedOption) return;
   const name  = document.getElementById('reqName').value.trim();
@@ -321,7 +388,7 @@ async function submitRequest() {
 
   const { room, opt } = selectedOption;
   const id = makeRequestId();
-  const ok = await fbPut('/requests/' + id, {
+  const reqObj = {
     roomId: room.id,
     roomName: room.name,
     date: opt.date,
@@ -332,7 +399,8 @@ async function submitRequest() {
     phone: phone.replace(/[^\d]/g, ''),
     status: 'open',
     createdAt: Date.now()
-  });
+  };
+  const ok = await fbPut('/requests/' + id, reqObj);
 
   if (!ok) {
     document.getElementById('formError').textContent = 'Network error — please try again';
@@ -340,8 +408,31 @@ async function submitRequest() {
   }
 
   document.getElementById('formOverlay').classList.remove('show');
-  document.getElementById('successSub').textContent =
-    `${room.name} · ${opt.s} – ${opt.e} (${opt.label})`;
+
+  // Auto-approve: try to confirm immediately. If the slot turned out to
+  // already be taken, tell the visitor instead of showing a false success
+  // and refresh the list so they can pick something else.
+  const autoApprove = await fbGet('/config/autoApproveBookings');
+  if (autoApprove === true) {
+    const booked = await tryAutoApprove(id, room, opt, reqObj);
+    if (!booked) {
+      document.getElementById('loadingState').style.display = 'none';
+      document.getElementById('slotList').innerHTML =
+        `<div class="no-slots">Sorry — that slot was just taken by someone else.<br>
+          <span style="font-size:12px;color:var(--muted);margin-top:8px;display:block">Please pick another below.</span>
+        </div>`;
+      await loadAvailability();
+      return;
+    }
+    document.getElementById('successSub').textContent =
+      `${room.name} · ${opt.s} – ${opt.e} (${opt.label}) — code required at the room`;
+    document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Booking confirmed!';
+  } else {
+    document.getElementById('successSub').textContent =
+      `${room.name} · ${opt.s} – ${opt.e} (${opt.label})`;
+    document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Request sent!';
+  }
+
   document.getElementById('successOverlay').classList.add('show');
   setTimeout(() => {
     document.getElementById('successOverlay').classList.remove('show');
