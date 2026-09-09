@@ -2547,7 +2547,7 @@ async function renderRequests() {
     // discovering it when Confirm is tapped and fails.
     if (status === 'open' && isSlotTaken(r)) status = 'taken';
     const dayLabel = r.date === today ? 'Today' : 'Tomorrow';
-    const showConfirm = status === 'open';
+    const showConfirm = status === 'open' || status === 'taken';
     const showEdit = status === 'open' || status === 'taken';
     return `<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding:12px 14px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
