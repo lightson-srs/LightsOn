@@ -730,6 +730,22 @@ function makeBlankRooms() {
 function makeRecurDefId() {
   return 'rd_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
+
+// Stable per-slot id. Every slot instance (one-time or materialized recurring)
+// gets one so activation can be matched by identity instead of array position —
+// the array reorders (recurring-first rematerialize, rollover) shift indices and
+// used to clobber/lose an activated slot's state. The id travels to Firebase as
+// an extra field (the ESP32 still reads slots by index and ignores it).
+function makeSlotId() {
+  return 'sl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+// Defensive: ensure every slot in an array has an id (old data / imports predate
+// the id). Mutates in place and returns the array. Called on load, restore, and
+// after any normalizeSlots of stored/remote data.
+function ensureSlotIds(slots) {
+  if (Array.isArray(slots)) slots.forEach(sl => { if (sl && !sl.id) sl.id = makeSlotId(); });
+  return slots;
+}
 const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
 // Compact label for a recurring slot's weekday set. Collapses a fully
@@ -1357,6 +1373,7 @@ async function confirmBookingImport() {
 
   const code = generate4DigitCode();
   const slot = {
+    id: makeSlotId(),
     s: start, e: end, recurring: false, code,
     activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
     _fresh: true,
@@ -1973,6 +1990,7 @@ async function saveSlotFromModal() {
   // Firebase — set it here too so the dashboard shows it active immediately.
   const autoActivate = !slotCode;
   r.slots[modalDay].push({
+    id: makeSlotId(),
     s: s, e: e, recurring,
     code: slotCode,
     paid,
@@ -2533,8 +2551,8 @@ function hydrate() {
     state.rooms = Array.isArray(savedRooms) ? savedRooms : makeBlankRooms();
     state.rooms.forEach(r => {
       if (r.slots) {
-        r.slots[0] = normalizeSlots(r.slots[0]);
-        r.slots[1] = normalizeSlots(r.slots[1]);
+        r.slots[0] = ensureSlotIds(normalizeSlots(r.slots[0]));
+        r.slots[1] = ensureSlotIds(normalizeSlots(r.slots[1]));
         // Defensive init: slots saved before the payment feature have no `paid`
         // field — normalize to a real boolean (reads already coerce via !!, this
         // just keeps the stored data clean/consistent).
@@ -2907,6 +2925,11 @@ async function checkDailySlotRefresh(p) {
     state.rooms[idx].slots[0] = normalizeSlots(data[key] && data[key].slots);
     state.rooms[idx].slots[1] = normalizeSlots(data[key] && data[key].slotsT);
     state.rooms[idx].recurringDefs = normalizeSlots(data[key] && data[key].recurring);
+    // Firebase is authoritative here — refresh pushRoom()'s "what did I last
+    // confirm was in Firebase" baseline to match, so the next push's id-diff
+    // (see pushRoom) isn't comparing against a stale pre-refresh baseline.
+    state.rooms[idx]._syncedSlotIds = state.rooms[idx].slots[0].map(sl => sl && sl.id).filter(Boolean);
+    state.rooms[idx]._syncedRecurDefIds = state.rooms[idx].recurringDefs.map(d => d && d.id).filter(Boolean);
   });
   p.slotsRolloverMarker = marker;
   persist();
@@ -3069,6 +3092,10 @@ async function manualSyncFromFirebase(opts) {
       state.rooms[idx].slots[0] = normalizeSlots(remote.slots);
       state.rooms[idx].slots[1] = normalizeSlots(remote.slotsT);
       state.rooms[idx].recurringDefs = normalizeSlots(remote.recurring);
+      // Refresh pushRoom()'s "what did I last confirm was in Firebase"
+      // baseline to match this authoritative pull (see pushRoom's id-diff).
+      state.rooms[idx]._syncedSlotIds = state.rooms[idx].slots[0].map(sl => sl && sl.id).filter(Boolean);
+      state.rooms[idx]._syncedRecurDefIds = state.rooms[idx].recurringDefs.map(d => d && d.id).filter(Boolean);
       // MANUAL sync only: also pull the room's manual override (Force ON/OFF/
       // Auto) so a change made on another device shows here. The live SSE /
       // polling / on-load auto-sync paths intentionally DON'T do this (they
@@ -3197,55 +3224,118 @@ async function pushRoom(idx, profile) {
     updatedAt: Date.now()
   }, p) && ok;
 
-  // Write each today slot individually — only structural fields, not activation
+  // ── Slots (today) — merge by id, optimistic-lock by slotTs ───────────
+  // Every slot carries a stable `id` (makeSlotId(), never reused) and a
+  // `slotTs` that is written ONLY here, right before each write — never at
+  // creation/edit call sites — so it always holds "the value this device
+  // last confirmed was in Firebase" until the instant this function decides
+  // to overwrite it. That is what makes the comparison below meaningful.
+  //
+  // The previous version wrote this device's local array by POSITION, then
+  // deleted every Firebase index beyond the local array's length ("ghost
+  // prune"). That silently deleted slots another device had added after
+  // this device's last sync, any time this device's local copy was short —
+  // the root cause of the "slots vanished" bug. This version diffs by id
+  // instead of by count:
+  //   - local slot, no remote match  → brand new — create it.
+  //   - local slot, remote match, same slotTs → this device's edit is based
+  //     on the current value — write it, stamping a fresh slotTs.
+  //   - local slot, remote match, DIFFERENT slotTs → someone else changed
+  //     it since we last read it. Firebase wins: adopt its data locally,
+  //     discard this device's edit, flag a conflict (see below).
+  //   - remote slot with no local match, id already in `_syncedSlotIds`
+  //     (this device previously confirmed it existed) → this device
+  //     removed it locally (delete / rollover / rematerialize) → prune it.
+  //   - remote slot with no local match, id NOT in `_syncedSlotIds` →
+  //     another device added it since our last sync → keep it, adopt it.
   const todaySlots = normalizeSlots(r.slots[0]);
+  const existingSlotsRaw = await fbGet(`${roomBase}/slots`, p);
+  const remoteSlotsArr = normalizeSlots(existingSlotsRaw);
+  const remoteById = new Map();
+  remoteSlotsArr.forEach(sl => { if (sl && sl.id) remoteById.set(sl.id, sl); });
+  // Before this feature shipped, /slots never carried an id at all — so on
+  // the FIRST push after upgrading, every remote slot in a room still looks
+  // "unmatched" even though it's the very slot a local entry represents.
+  // Correlate by position for this one transitional push only (matching the
+  // old behavior exactly), so nothing gets written twice. From the next push
+  // on, every slot has an id and this fallback never triggers again.
+  const noRemoteIdsYet = remoteSlotsArr.length > 0 && remoteById.size === 0;
+  const syncedSlotIds = new Set(Array.isArray(r._syncedSlotIds) ? r._syncedSlotIds : []);
+
+  let slotConflict = false;
+  const finalSlots = [];
+  const slotPatches = [];
+  const placedIds = new Set();
+  const consumedRemote = new Set(); // remote slot objects already matched to a local one
+
+  const buildSlotPatch = (sl) => ({
+    id: sl.id, slotTs: sl.slotTs,
+    s: sl.s, e: sl.e,
+    recurring: sl.recurring,
+    code: sl.code,
+    date: sl.date,
+    // Booker name/phone — must be written so activate.html can show the
+    // booked-under name against each slot and the WhatsApp reminder works.
+    bookedBy: sl.bookedBy || null,
+    phone: sl.phone || null,
+    // Payment status (paid/unpaid) — written so it survives sync and shows
+    // on other devices. Default false when absent.
+    paid: !!sl.paid,
+    // Per-slot recurring weekday set (0=Sun..6=Sat) — written so the day-of-
+    // week recurrence persists and reaches the ESP32. null for non-recurring
+    // slots or recurring slots with no restriction (runs every day).
+    days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null,
+    // For a slot this device isn't actively writing (a foreign addition, or
+    // one just adopted from a conflict) this mirrors whatever Firebase
+    // already has — see the explicit override below for this device's own
+    // writes, which always clear a stale expired flag.
+    expired: !!sl.expired
+    // activatedAt/By/attempts/lockedUntil NOT written here — managed
+    // exclusively by activateSlot/deactivateSlot/activate.html, and
+    // blanket-resetting them on every save would turn off a light someone
+    // just legitimately activated if the owner edits a sibling slot in the
+    // same room around the same time.
+  });
+
   for (let si = 0; si < todaySlots.length; si++) {
     const sl = todaySlots[si];
-    const patch = {
-      s: sl.s, e: sl.e,
-      recurring: sl.recurring,
-      code: sl.code,
-      date: sl.date,
-      // Booker name/phone — must be written so activate.html can show the
-      // booked-under name against each slot and the WhatsApp reminder works.
-      // Omitting them (as this patch used to) left bookedBy undefined in
-      // Firebase, so the activation page never displayed it. null clears the
-      // field for a slot with no booker rather than leaving a stale value.
-      bookedBy: sl.bookedBy || null,
-      phone: sl.phone || null,
-      // Payment status (paid/unpaid) — written so it survives sync and shows
-      // on other devices. Default false when absent.
-      paid: !!sl.paid,
-      // Per-slot recurring weekday set (0=Sun..6=Sat) — written so the day-of-
-      // week recurrence persists and reaches the ESP32. null for non-recurring
-      // slots or recurring slots with no restriction (runs every day).
-      days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null,
-      // expired IS explicitly reset here (unlike activatedAt/attempts/
-      // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
-      // touches fields it's given, so without this a slot that reuses a
-      // Firebase index a past, unactivated booking already expired (e.g.
-      // a recurring slot hitting the same index every day, or a fresh
-      // slot created after an old one was deleted) silently inherits
-      // that stale expired:true forever. Safe to always clear: any slot
-      // still in r.slots[0] that's genuinely past its end time is already
-      // hidden from activate.html's own "not yet ended" filter regardless
-      // of this flag, so there's nothing visible to regress.
-      expired: false
-      // activatedAt/By/attempts/lockedUntil NOT written here on every
-      // push — managed exclusively by activateSlot/deactivateSlot/
-      // activate.html, and blanket-resetting them on every save would
-      // turn off a light someone just legitimately activated if the
-      // owner edits a sibling slot in the same room around the same time.
-    };
-    // A BRAND NEW slot is the one case those fields must still be reset:
+    if (!sl.id) sl.id = makeSlotId();
+    let remote = remoteById.get(sl.id);
+    if (!remote && noRemoteIdsYet) {
+      const positional = remoteSlotsArr[si];
+      if (positional && !positional.id) remote = positional;
+    }
+    if (remote) consumedRemote.add(remote);
+
+    if (remote && typeof remote.slotTs === 'number' && typeof sl.slotTs === 'number' && remote.slotTs !== sl.slotTs) {
+      // Someone else updated this slot since we last read it — Firebase
+      // wins. Adopt its data locally instead of overwriting it with our
+      // stale edit; the user has to redo their change after a Sync.
+      Object.assign(sl, remote);
+      finalSlots.push(sl);
+      slotPatches.push(buildSlotPatch(sl));
+      placedIds.add(sl.id);
+      slotConflict = true;
+      continue;
+    }
+
+    const patch = buildSlotPatch(sl);
+    patch.slotTs = Date.now();
+    // expired IS explicitly reset here (unlike activatedAt/attempts/
+    // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
+    // touches fields it's given, so without this a slot that reuses a
+    // Firebase index a past, unactivated booking already expired (e.g. a
+    // fresh slot created after an old one was deleted) silently inherits
+    // that stale expired:true forever. Safe to always clear here: any slot
+    // still in r.slots[0] that's genuinely past its end time is already
+    // hidden from activate.html's own "not yet ended" filter regardless of
+    // this flag, so there's nothing visible to regress.
+    patch.expired = false;
+    // A BRAND NEW slot is the one case activation fields must be (re)seeded:
     // otherwise it silently inherits whatever activatedAt/attempts/
-    // lockedUntil a previous, unrelated booking left behind at this same
-    // Firebase index (e.g. a slot created after an old one was deleted,
-    // or a second overlapping slot landing on an index a now-finished
-    // earlier slot had already activated) — the ESP32 then reads that
-    // stale activatedAt and switches the relay on for a slot no one
-    // actually activated. _fresh is set only at creation and cleared
-    // right after this first push, so later edits never re-trigger it.
+    // lockedUntil a previous, unrelated booking left behind. _fresh is set
+    // only at creation and cleared right after this first push, so later
+    // edits never re-trigger it.
     if (sl._fresh) {
       // A no-code ("Auto") slot is active by default: seed activatedAt so the
       // relay comes on for its window and the dashboard shows it "✓ Active"
@@ -3267,29 +3357,46 @@ async function pushRoom(idx, profile) {
                  // before the next push would resurrect it and reset
                  // activation state again on some later, unrelated save
     }
-    ok = await fbPatch(`${roomBase}/slots/${si}`, patch, p) && ok;
+    sl.slotTs = patch.slotTs;
+    finalSlots.push(sl);
+    slotPatches.push(patch);
+    placedIds.add(sl.id);
   }
 
-  // Prune ghost slot entries left behind when the array shrinks (e.g.
-  // after deleting a slot) — the loop above only ever PATCHes indices
-  // still in use, so anything beyond today's count would otherwise sit
-  // in Firebase forever, get picked up by the ESP32's blind index scan,
-  // and reappear on the next pull-sync.
-  //
-  // IMPORTANT: Firebase RTDB serves contiguous 0,1,2,… keys back as a JSON
-  // ARRAY, not an object, so an earlier `!Array.isArray` guard here skipped
-  // pruning in the normal case and let deleted slots resurrect. Handle both
-  // shapes — Object.keys() gives "0","1",… for an array too — and null out
-  // every index at or beyond the current count.
-  const existingSlots = await fbGet(`${roomBase}/slots`, p);
-  if (existingSlots && typeof existingSlots === 'object') {
-    for (const key of Object.keys(existingSlots)) {
+  // Remote slots this device never matched to a local one: keep the ones no
+  // one told us about yet (another device's addition — including one this
+  // device's own stale array is simply missing), drop the ones this device
+  // knows it removed.
+  remoteSlotsArr.forEach(remote => {
+    if (!remote || consumedRemote.has(remote)) return;
+    if (!remote.id) remote.id = makeSlotId();               // migrate legacy, id-less data
+    if (typeof remote.slotTs !== 'number') remote.slotTs = Date.now();
+    if (placedIds.has(remote.id)) return;
+    if (syncedSlotIds.has(remote.id)) return; // known + now locally absent → intentional delete
+    finalSlots.push(remote);
+    slotPatches.push(buildSlotPatch(remote));
+    placedIds.add(remote.id);
+  });
+
+  // Write the merged, deduped set back as a fresh compact 0..N-1 array so the
+  // ESP32's positional read keeps working unchanged, then prune anything
+  // left over in Firebase beyond this length (same technique as before, but
+  // the cutoff now reflects every slot that legitimately belongs — including
+  // ones this device didn't create — so it can never eat another device's
+  // addition again).
+  for (let i = 0; i < finalSlots.length; i++) {
+    ok = await fbPatch(`${roomBase}/slots/${i}`, slotPatches[i], p) && ok;
+  }
+  if (existingSlotsRaw && typeof existingSlotsRaw === 'object') {
+    for (const key of Object.keys(existingSlotsRaw)) {
       const ghostIdx = parseInt(key, 10);
-      if (!isNaN(ghostIdx) && ghostIdx >= todaySlots.length) {
+      if (!isNaN(ghostIdx) && ghostIdx >= finalSlots.length) {
         ok = await fbSet(`${roomBase}/slots/${ghostIdx}`, null, p) && ok;
       }
     }
   }
+  r.slots[0] = finalSlots;
+  r._syncedSlotIds = finalSlots.map(sl => sl.id).filter(Boolean);
 
   // Write slotsT (tomorrow) — these are never activated so safe to write fully.
   // days IS included now so a recurring slot seeded into tomorrow keeps its
@@ -3303,41 +3410,105 @@ async function pushRoom(idx, profile) {
   }));
   ok = await fbPatch(roomBase, { slotsT }, p) && ok;
 
-  // Write the authoritative recurring DEFINITIONS to /rooms/roomN/recurring.
-  // These are the source of truth for what recurs; the ESP32 and PWA rollover
-  // generate day buckets from them. Written wholesale like slotsT (defs never
-  // carry live activation state). Per-index write + ghost-prune so a removed
-  // def actually disappears in Firebase (same technique as the slots prune).
+  // ── Recurring definitions — merge by id, optimistic-lock by defTs ─────
+  // /rooms/roomN/recurring is the source of truth for what recurs; the ESP32
+  // and PWA rollover generate day buckets from it. Same id/timestamp merge
+  // scheme as the slots section above (defs already carried an `id`, so the
+  // "legacy, id-less data" fallback below is a defensive no-op in practice
+  // rather than the everyday case slots hit on the first post-upgrade push).
   const defs = Array.isArray(r.recurringDefs) ? r.recurringDefs : [];
+  const existingDefsRaw = await fbGet(`${roomBase}/recurring`, p);
+  const remoteDefsArr = normalizeSlots(existingDefsRaw);
+  const remoteDefById = new Map();
+  remoteDefsArr.forEach(d => { if (d && d.id) remoteDefById.set(d.id, d); });
+  const noRemoteDefIdsYet = remoteDefsArr.length > 0 && remoteDefById.size === 0;
+  const syncedDefIds = new Set(Array.isArray(r._syncedRecurDefIds) ? r._syncedRecurDefIds : []);
+
+  let defConflict = false;
+  const finalDefs = [];
+  const defPatches = [];
+  const placedDefIds = new Set();
+  const consumedRemoteDefs = new Set();
+
+  const buildDefPatch = (d) => ({
+    id: d.id, defTs: d.defTs,
+    s: d.s, e: d.e,
+    days: (Array.isArray(d.days) && d.days.length) ? d.days : null,
+    code: d.code || null,
+    bookedBy: d.bookedBy || null,
+    phone: d.phone || null,
+    paid: !!d.paid
+  });
+
   for (let di = 0; di < defs.length; di++) {
     const d = defs[di];
-    ok = await fbPatch(`${roomBase}/recurring/${di}`, {
-      id: d.id, s: d.s, e: d.e,
-      days: (Array.isArray(d.days) && d.days.length) ? d.days : null,
-      code: d.code || null,
-      bookedBy: d.bookedBy || null,
-      phone: d.phone || null,
-      paid: !!d.paid
-    }, p) && ok;
+    if (!d.id) d.id = makeRecurDefId();
+    let remote = remoteDefById.get(d.id);
+    if (!remote && noRemoteDefIdsYet) {
+      const positional = remoteDefsArr[di];
+      if (positional && !positional.id) remote = positional;
+    }
+    if (remote) consumedRemoteDefs.add(remote);
+
+    if (remote && typeof remote.defTs === 'number' && typeof d.defTs === 'number' && remote.defTs !== d.defTs) {
+      // Someone else edited this recurring definition since we last read it —
+      // Firebase wins; discard this device's edit and adopt the remote copy.
+      Object.assign(d, remote);
+      finalDefs.push(d);
+      defPatches.push(buildDefPatch(d));
+      placedDefIds.add(d.id);
+      defConflict = true;
+      continue;
+    }
+
+    const patch = buildDefPatch(d);
+    patch.defTs = Date.now();
+    d.defTs = patch.defTs;
+    finalDefs.push(d);
+    defPatches.push(patch);
+    placedDefIds.add(d.id);
   }
-  const existingDefs = await fbGet(`${roomBase}/recurring`, p);
-  if (existingDefs && typeof existingDefs === 'object') {
-    for (const key of Object.keys(existingDefs)) {
+
+  remoteDefsArr.forEach(remote => {
+    if (!remote || consumedRemoteDefs.has(remote)) return;
+    if (!remote.id) remote.id = makeRecurDefId();
+    if (typeof remote.defTs !== 'number') remote.defTs = Date.now();
+    if (placedDefIds.has(remote.id)) return;
+    if (syncedDefIds.has(remote.id)) return; // known + now locally absent → intentional delete
+    finalDefs.push(remote);
+    defPatches.push(buildDefPatch(remote));
+    placedDefIds.add(remote.id);
+  });
+
+  for (let i = 0; i < finalDefs.length; i++) {
+    ok = await fbPatch(`${roomBase}/recurring/${i}`, defPatches[i], p) && ok;
+  }
+  if (existingDefsRaw && typeof existingDefsRaw === 'object') {
+    for (const key of Object.keys(existingDefsRaw)) {
       const gi = parseInt(key, 10);
-      if (!isNaN(gi) && gi >= defs.length) {
+      if (!isNaN(gi) && gi >= finalDefs.length) {
         ok = await fbSet(`${roomBase}/recurring/${gi}`, null, p) && ok;
       }
     }
   }
+  r.recurringDefs = finalDefs;
+  r._syncedRecurDefIds = finalDefs.map(d => d.id).filter(Boolean);
 
-  // Clear the dirty marker only on a fully-successful push — otherwise leave
-  // it set so the next Sync retries this room. Persist so the flag survives
-  // a reload (an edit made offline stays "uncommitted" until it uploads).
-  if (ok && r._dirty) { delete r._dirty; persist(); }
+  const conflict = slotConflict || defConflict;
+  // A conflict means we discarded this device's own edit and adopted
+  // Firebase's version instead — there's nothing left of this device's
+  // change to retry, so that part of the room is "clean" even though the
+  // edit itself didn't survive.
+  if ((ok || conflict) && r._dirty) { delete r._dirty; persist(); }
+
+  if (conflict) {
+    addLog('error', `room${r.id}: a slot/recurring change was overwritten elsewhere — this device's edit was NOT saved; Sync and try again`);
+    showToast('⚠️ ' + (r.name || ('Room ' + r.id)) + ': someone else changed this — Sync and try again');
+  }
 
   addLog(ok ? 'ok' : 'error', `room${r.id} → Firebase`);
   setConnStatus(ok);
-  return ok;
+  return ok && !conflict;
 }
 
 // ── Manual slot rollover — same rule as the ESP32's midnightRollover() ──
@@ -3401,6 +3572,7 @@ function harvestRecurringDefs(r) {
 // resets activation (fresh instance for a new day).
 function materializeRecurringSlot(def, dateStr) {
   return {
+    id: makeSlotId(),
     s: def.s, e: def.e,
     recurring: true,
     defId: def.id,
@@ -3914,6 +4086,7 @@ async function copySlots(fromId) {
       const startIdx = normalizeSlots(toRoom.slots[0]).length;
       const newSlots = day0slots.map(sl => ({
         ...sl,
+        id: makeSlotId(),            // fresh id — the copy is a distinct slot
         code: generate4DigitCode(),  // fresh code per room
         activatedAt: null,           // reset activation
         activatedBy: null,
@@ -3932,6 +4105,7 @@ async function copySlots(fromId) {
       if (!toRoom.slots[1]) toRoom.slots[1] = [];
       tomorrowSlots.forEach(sl => toRoom.slots[1].push({
         ...sl,
+        id: makeSlotId(),            // fresh id — the copy is a distinct slot
         code: generate4DigitCode(),  // fresh code per room
         activatedAt: null,
         activatedBy: null,
@@ -4846,8 +5020,8 @@ function restoreFromFile(event) {
       state.rooms = Array.isArray(savedRooms) ? savedRooms : makeBlankRooms();
       state.rooms.forEach(r => {
         if (r.slots) {
-          r.slots[0] = normalizeSlots(r.slots[0]);
-          r.slots[1] = normalizeSlots(r.slots[1]);
+          r.slots[0] = ensureSlotIds(normalizeSlots(r.slots[0]));
+          r.slots[1] = ensureSlotIds(normalizeSlots(r.slots[1]));
           // Normalize payment flag on restored slots (old backups lack it).
           r.slots[0].forEach(sl => { sl.paid = !!sl.paid; });
           r.slots[1].forEach(sl => { sl.paid = !!sl.paid; });
