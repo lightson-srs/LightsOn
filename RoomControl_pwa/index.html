@@ -3605,9 +3605,25 @@ function rolloverRoomLocally(r) {
   // ── Build new TODAY ────────────────────────────────────────
   // 1. Regenerate every recurring DEFINITION that runs on the new today's
   //    weekday — from recurringDefs (the source of truth), NOT from buckets.
+  //    If this same occurrence was already activated in the PRE-rollover
+  //    tomorrow bucket (e.g. someone used the activation page's lookahead
+  //    window to activate it before midnight), carry that activation
+  //    forward instead of resetting it — rollover relabels the day, it
+  //    isn't a new booking. Matched by defId, falling back to s+e (same
+  //    fallback deleteRecurringDef() uses) for an instance materialized by
+  //    firmware that predates the defId field.
   const regenToday = defs
     .filter(def => recurringRunsOnDay(def, newTodayWd))
-    .map(def => materializeRecurringSlot(def, todayDateStr));
+    .map(def => {
+      const fresh = materializeRecurringSlot(def, todayDateStr);
+      const preActivated = tomorrowSlots.find(sl => sl.recurring && sl.activatedAt &&
+        (sl.defId === def.id || (!sl.defId && sl.s === def.s && sl.e === def.e)));
+      if (preActivated) {
+        fresh.activatedAt = preActivated.activatedAt;
+        fresh.activatedBy = preActivated.activatedBy;
+      }
+      return fresh;
+    });
   // 2. Keep today's own one-time slots that are genuinely still today
   //    (created after an earlier rollover today) — untouched, activation kept.
   const keptOneTimeToday = todaySlots.filter(sl => !sl.recurring && sl.date === todayDateStr);
