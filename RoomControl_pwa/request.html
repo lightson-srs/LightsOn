@@ -38,11 +38,19 @@
     .slot-card { background: var(--card); border-radius: 10px; padding: 10px; border: 1px solid var(--border); cursor: pointer; transition: border-color 0.2s; display: flex; flex-direction: column; gap: 5px; }
     .slot-card:hover { border-color: var(--accent); }
     .slot-card.selected { border-color: var(--accent); background: rgba(74,143,255,0.08); }
+    /* Tomorrow's cards get their own amber colour scheme so the two days are
+       distinguishable at a glance, not just by reading the small day label. */
+    .slot-card.tomorrow { border-color: rgba(240,160,48,0.35); background: rgba(240,160,48,0.07); }
+    .slot-card.tomorrow:hover { border-color: var(--amber); }
+    .slot-card.tomorrow.selected { border-color: var(--amber); background: rgba(240,160,48,0.14); }
     .slot-card-top { display: flex; align-items: center; gap: 6px; }
     .slot-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--green); }
+    .slot-card.tomorrow .slot-dot { background: var(--amber); }
     .slot-time { font-size: 13px; font-weight: 600; }
     .slot-badge { font-size: 9px; color: var(--muted); }
+    .slot-card.tomorrow .slot-badge { color: var(--amber); font-weight: 600; }
     .slot-status-badge { align-self: flex-start; font-size: 9px; padding: 4px 8px; border-radius: 12px; font-weight: 600; white-space: nowrap; background: rgba(74,143,255,0.12); color: var(--accent); }
+    .slot-card.tomorrow .slot-status-badge { background: rgba(240,160,48,0.16); color: var(--amber); }
     .no-slots { text-align: center; padding: 40px 20px; color: var(--muted); font-size: 14px; }
 
     /* Name/phone form overlay — same bottom-sheet pattern as the PIN pad */
@@ -281,7 +289,7 @@ function renderOptions() {
 
   container.innerHTML = allRooms.map(room => {
     const cards = room.options.map((opt, idx) => `
-      <div class="slot-card" onclick="selectOption(${room.id}, ${idx})">
+      <div class="slot-card${opt.dayIdx === 1 ? ' tomorrow' : ''}" onclick="selectOption(${room.id}, ${idx})">
         <div class="slot-card-top">
           <div class="slot-dot"></div>
           <div class="slot-time">${opt.s} – ${opt.e}</div>
