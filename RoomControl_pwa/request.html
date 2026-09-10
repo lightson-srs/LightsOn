@@ -32,14 +32,17 @@
        an explicit width:60% shrinks the card's footprint horizontally too). */
     .room-group { margin-bottom: 22px; }
     .room-group-title { font-size: 17px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 12px; padding: 0 2px; }
-    .slot-card { background: var(--card); border-radius: 10px; padding: 11px 12px; margin-bottom: 7px; border: 1px solid var(--border); cursor: pointer; display: flex; align-items: center; gap: 10px; transition: border-color 0.2s; width: 60%; }
+    /* Two cards per row — makes better use of the screen width and needs
+       far less vertical scrolling than a single full-width column. */
+    .slot-cards-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .slot-card { background: var(--card); border-radius: 10px; padding: 10px; border: 1px solid var(--border); cursor: pointer; transition: border-color 0.2s; display: flex; flex-direction: column; gap: 5px; }
     .slot-card:hover { border-color: var(--accent); }
     .slot-card.selected { border-color: var(--accent); background: rgba(74,143,255,0.08); }
+    .slot-card-top { display: flex; align-items: center; gap: 6px; }
     .slot-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--green); }
-    .slot-info { flex: 1; }
-    .slot-time { font-size: 12px; font-weight: 600; }
-    .slot-badge { font-size: 8px; color: var(--muted); margin-top: 3px; }
-    .slot-status-badge { font-size: 8px; padding: 4px 8px; border-radius: 12px; font-weight: 600; white-space: nowrap; background: rgba(74,143,255,0.12); color: var(--accent); }
+    .slot-time { font-size: 13px; font-weight: 600; }
+    .slot-badge { font-size: 9px; color: var(--muted); }
+    .slot-status-badge { align-self: flex-start; font-size: 9px; padding: 4px 8px; border-radius: 12px; font-weight: 600; white-space: nowrap; background: rgba(74,143,255,0.12); color: var(--accent); }
     .no-slots { text-align: center; padding: 40px 20px; color: var(--muted); font-size: 14px; }
 
     /* Name/phone form overlay — same bottom-sheet pattern as the PIN pad */
@@ -279,17 +282,17 @@ function renderOptions() {
   container.innerHTML = allRooms.map(room => {
     const cards = room.options.map((opt, idx) => `
       <div class="slot-card" onclick="selectOption(${room.id}, ${idx})">
-        <div class="slot-dot"></div>
-        <div class="slot-info">
+        <div class="slot-card-top">
+          <div class="slot-dot"></div>
           <div class="slot-time">${opt.s} – ${opt.e}</div>
-          <div class="slot-badge">${opt.label}</div>
         </div>
+        <div class="slot-badge">${opt.label}</div>
         <span class="slot-status-badge">Tap to request</span>
       </div>
     `).join('');
     return `<div class="room-group">
       <div class="room-group-title">${room.name}</div>
-      ${cards}
+      <div class="slot-cards-grid">${cards}</div>
     </div>`;
   }).join('');
 }
