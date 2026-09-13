@@ -883,9 +883,17 @@ async function validateLicenseKey(raw) {
 // Normalize Firebase slots — converts object {0:{...}} to array [{...}]
 function normalizeSlots(slots) {
   if (!slots) return [];
-  if (Array.isArray(slots)) return slots;
-  // Firebase converted array to object with numeric keys
-  return Object.keys(slots).sort((a,b) => parseInt(a)-parseInt(b)).map(k => slots[k]).filter(Boolean);
+  const arr = Array.isArray(slots)
+    ? slots
+    // Firebase converted array to object with numeric keys
+    : Object.keys(slots).sort((a,b) => parseInt(a)-parseInt(b)).map(k => slots[k]);
+  // Drop anything that isn't a real slot object with valid s/e time strings —
+  // a null hole (Firebase array with a deleted index) or any other malformed
+  // entry has no time range to render/schedule against; every reader of this
+  // function assumes sl.s/sl.e are strings, so this is the one choke-point
+  // that keeps a single bad entry from crashing the whole app (e.g. a
+  // TypeError on undefined.split(':') during rendering).
+  return arr.filter(sl => sl && typeof sl.s === 'string' && typeof sl.e === 'string');
 }
 
 // ── Payment status + partial-hour helpers ─────────────────────
@@ -3695,10 +3703,15 @@ async function pushRoom(idx, profile) {
     // an ALREADY-BOOKED remote slot for the exact same time: two devices each
     // adding a slot for the same room+time, without syncing in between, get
     // different ids from makeSlotId(), so the id-based matching above can't
-    // catch it. Only checked for _fresh slots — an existing slot being edited
-    // is already matched by id above and must never be redirected here just
-    // because it happens to share a time with something else.
-    if (!remote && sl._fresh) {
+    // catch it. Only checked for _fresh, ONE-TIME slots — an existing slot
+    // being edited is already matched by id above and must never be
+    // redirected here just because it happens to share a time with something
+    // else, and recurring instances are excluded entirely: they're marked
+    // _fresh on EVERY rematerializeRecurringBuckets() call (saving any def in
+    // the room regenerates every sibling instance with a brand-new id), so
+    // treating that as "new" would false-positive a conflict against their
+    // own still-current remote twin on every single recurring save.
+    if (!remote && sl._fresh && !sl.recurring) {
       remote = remoteSlotsArr.find(r2 => r2 && !consumedRemote.has(r2) && r2.s === sl.s && r2.e === sl.e);
       if (remote) {
         consumedRemote.add(remote);
