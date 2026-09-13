@@ -129,7 +129,12 @@ String profileNum;
 // daysMask: 7-bit weekday set for recurring slots — bit 0=Sun .. bit 6=Sat.
 // 0 = no restriction (runs every day), which keeps pre-V1 recurring slots
 // (and all non-recurring slots) behaving exactly as before.
-struct Slot { int sh, sm, eh, em; bool recurring; bool activated; bool expired; int daysMask; };
+// slotTs mirrors the PWA's per-slot modified-at timestamp (written by
+// pushRoom() on every create/edit). Kept as a string purely for equality
+// comparison in refreshSlotsOnly() — it's a JS millisecond timestamp
+// (~13 digits), too large for a 32-bit int, and nothing here ever needs
+// to do arithmetic on it, only detect "did this slot's content change."
+struct Slot { int sh, sm, eh, em; bool recurring; bool activated; bool expired; int daysMask; char slotTs[16]; };
 
 // A recurring DEFINITION read from /rooms/roomN/recurring — the authoritative
 // source the day buckets are generated FROM during rollover. daysMask uses the
@@ -504,8 +509,10 @@ void parseSlots(int idx, String json) {
       bool isActivated = false;
       bool isExpired   = false;
       int  slotDaysMask = 0; // 0 = every day (see Slot.daysMask)
+      String slotTsStr = ""; // "" if absent — compares unequal to any real timestamp, which is fine
       if (objStart >= 0 && objEnd >= 0) {
         String slotObj = json.substring(objStart, objEnd + 1);
+        slotTsStr = extractRawField(slotObj, "slotTs");
         // Recurring flag
         isRecurring = slotObj.indexOf("\"recurring\":true") >= 0;
         // Activated: activatedAt exists and is NOT null. This is now the SINGLE
@@ -546,7 +553,11 @@ void parseSlots(int idx, String json) {
           }
         }
       }
-      tempSlots[tempCount++] = {sh, sm, eh, em, isRecurring, isActivated, isExpired, slotDaysMask};
+      // char[] can't be filled via the brace initializer above, so set the
+      // scalar fields there and copy slotTs in as a separate step.
+      tempSlots[tempCount] = {sh, sm, eh, em, isRecurring, isActivated, isExpired, slotDaysMask};
+      slotTsStr.toCharArray(tempSlots[tempCount].slotTs, sizeof(tempSlots[tempCount].slotTs));
+      tempCount++;
     }
     pos = max(si, ei) + 10;
   }
@@ -783,25 +794,34 @@ void refreshSlotsOnly() {
       // Save previous state for comparison
       int  prevCount = rooms[i].slotCount;
       bool prevActivated[10] = {};
-      for (int j = 0; j < rooms[i].slotCount && j < 10; j++)
+      char prevSlotTs[10][16] = {{0}};
+      for (int j = 0; j < rooms[i].slotCount && j < 10; j++) {
         prevActivated[j] = rooms[i].slots[j].activated;
+        strncpy(prevSlotTs[j], rooms[i].slots[j].slotTs, sizeof(prevSlotTs[j]));
+      }
 
       parseSlots(i, slotJson);
 
-      // Re-apply if slot count changed OR any activation flag changed
-      bool activationChanged = false;
+      // Re-apply if slot count changed, any activation flag changed, or any
+      // slot's own slotTs changed. slotTs is the PWA's per-slot "this
+      // content was touched" marker (written on every create/edit, e.g. a
+      // time-range or code change) -- comparing it catches edits the
+      // activation-only check above would otherwise miss, since editing a
+      // slot's time doesn't necessarily also change whether it's activated.
+      bool needsReapply = false;
       if (rooms[i].slotCount != prevCount) {
-        activationChanged = true;
+        needsReapply = true;
       } else {
         for (int j = 0; j < rooms[i].slotCount; j++) {
-          if (rooms[i].slots[j].activated != prevActivated[j]) {
-            activationChanged = true;
+          if (rooms[i].slots[j].activated != prevActivated[j] ||
+              strcmp(rooms[i].slots[j].slotTs, prevSlotTs[j]) != 0) {
+            needsReapply = true;
             break;
           }
         }
       }
 
-      if (activationChanged) {
+      if (needsReapply) {
         applyState(i);
       }
     }
