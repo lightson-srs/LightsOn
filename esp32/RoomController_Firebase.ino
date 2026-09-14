@@ -494,6 +494,10 @@ void parseSlots(int idx, String json) {
   Slot tempSlots[10];
   int  tempCount = 0;
   int  pos = 0;
+  bool sawSlotObject = false; // true if we parsed ANY real slot object, deleted
+                              // or not — distinguishes "every slot got soft-
+                              // deleted, count really is 0" from "couldn't
+                              // parse anything", which must NOT stomp slotCount
 
   while (pos < (int)json.length() && tempCount < 10) {
     int si = json.indexOf("\"s\":\"", pos);
@@ -503,16 +507,22 @@ void parseSlots(int idx, String json) {
     String endStr   = json.substring(ei + 5, ei + 10);
     int sh, sm, eh, em;
     if (parseTime(startStr, sh, sm) && parseTime(endStr, eh, em)) {
+      sawSlotObject = true; // saw a real slot object, even if it turns out deleted below
       int objStart = json.lastIndexOf('{', si);
       int objEnd   = json.indexOf('}', ei);
       bool isRecurring = false;
       bool isActivated = false;
       bool isExpired   = false;
+      bool isDeleted   = false;
       int  slotDaysMask = 0; // 0 = every day (see Slot.daysMask)
       String slotTsStr = ""; // "" if absent — compares unequal to any real timestamp, which is fine
       if (objStart >= 0 && objEnd >= 0) {
         String slotObj = json.substring(objStart, objEnd + 1);
         slotTsStr = extractRawField(slotObj, "slotTs");
+        // Soft-deleted (see the PWA's deleteSlot()) — skip entirely, never
+        // scheduled/activated. It stays in Firebase, still carrying its id,
+        // until the next midnightRollover() permanently drops it.
+        isDeleted = slotObj.indexOf("\"deleted\":true") >= 0;
         // Recurring flag
         isRecurring = slotObj.indexOf("\"recurring\":true") >= 0;
         // Activated: activatedAt exists and is NOT null. This is now the SINGLE
@@ -553,16 +563,18 @@ void parseSlots(int idx, String json) {
           }
         }
       }
-      // char[] can't be filled via the brace initializer above, so set the
-      // scalar fields there and copy slotTs in as a separate step.
-      tempSlots[tempCount] = {sh, sm, eh, em, isRecurring, isActivated, isExpired, slotDaysMask};
-      slotTsStr.toCharArray(tempSlots[tempCount].slotTs, sizeof(tempSlots[tempCount].slotTs));
-      tempCount++;
+      if (!isDeleted) {
+        // char[] can't be filled via the brace initializer above, so set the
+        // scalar fields there and copy slotTs in as a separate step.
+        tempSlots[tempCount] = {sh, sm, eh, em, isRecurring, isActivated, isExpired, slotDaysMask};
+        slotTsStr.toCharArray(tempSlots[tempCount].slotTs, sizeof(tempSlots[tempCount].slotTs));
+        tempCount++;
+      }
     }
     pos = max(si, ei) + 10;
   }
 
-  if (tempCount > 0 || json == "[]") {
+  if (tempCount > 0 || json == "[]" || sawSlotObject) {
     rooms[idx].slotCount = tempCount;
     for (int i = 0; i < tempCount; i++) rooms[idx].slots[i] = tempSlots[i];
     mergeSlots(idx);
@@ -1159,6 +1171,9 @@ bool midnightRollover() {
       String existingSlot = fbGet(base + "/slots/" + String(j));
       if (existingSlot == "error" || existingSlot == "null" || existingSlot.length() < 5) continue;
       if (extractStringField(existingSlot, "date") != todayDateStr) continue; // not today — genuinely stale, drop it
+      // Soft-deleted (PWA's deleteSlot()) — this is the permanent purge the
+      // tombstone was waiting for: just don't carry it into the new today.
+      if (existingSlot.indexOf("\"deleted\":true") >= 0) continue;
       if (!first) newTodayJson += ",";
       newTodayJson += existingSlot;
       first = false;
@@ -1177,8 +1192,10 @@ bool midnightRollover() {
         int objEnd   = tomorrowJson.indexOf('}', ei);
         if (objStart >= 0 && objEnd >= 0) {
           String obj = tomorrowJson.substring(objStart, objEnd + 1);
-          // Only move one-time slots (skip recurring)
-          if (obj.indexOf("\"recurring\":true") < 0) {
+          // Only move one-time, non-deleted slots (skip recurring, and skip a
+          // soft-deleted tomorrow slot — that's this tombstone's permanent
+          // purge, same as the "keep today's slots" loop above).
+          if (obj.indexOf("\"recurring\":true") < 0 && obj.indexOf("\"deleted\":true") < 0) {
             String startStr = tomorrowJson.substring(si + 5, si + 10);
             String endStr   = tomorrowJson.substring(ei + 5, ei + 10);
             if (!first) newTodayJson += ",";

@@ -234,7 +234,7 @@ async function loadAvailability() {
       const buildOccupied = (slots, weekday) => {
         const occ = new Array(24).fill(false);
         normalizeArr(slots).forEach(sl => {
-          if (!sl || !sl.s || !sl.e) return;
+          if (!sl || !sl.s || !sl.e || sl.deleted) return;
           if (sl.recurring && Array.isArray(sl.days) && sl.days.length && !sl.days.includes(weekday)) return;
           const si = Math.floor(toMins(sl.s) / 60);
           const ei = Math.ceil(toMins(sl.e) / 60);
@@ -363,7 +363,7 @@ async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
 async function tryAutoApprove(id, room, opt, reqObj) {
   const bucketPath = '/rooms/room' + room.id + (opt.dayIdx === 0 ? '/slots' : '/slotsT');
   const arr = normalizeArr(await fbGet(bucketPath));
-  const collision = arr.some(sl => sl && sl.s === opt.s && sl.e === opt.e);
+  const collision = arr.some(sl => sl && !sl.deleted && sl.s === opt.s && sl.e === opt.e);
   if (collision) {
     await fbPut('/requests/' + id, { ...reqObj, status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' });
     return false;

@@ -896,6 +896,19 @@ function normalizeSlots(slots) {
   return arr.filter(sl => sl && typeof sl.s === 'string' && typeof sl.e === 'string');
 }
 
+// Slots this device deletes are soft-deleted (deleted:true + a fresh slotTs)
+// rather than spliced out — see deleteSlot(). That makes a delete just another
+// timestamped edit that flows through pushRoom()'s normal id+slotTs merge
+// instead of being represented by absence, which is what caused the
+// ghost-prune/resurrection bugs earlier this session. normalizeSlots() must
+// keep returning tombstones (the sync/merge machinery needs the full picture
+// to keep propagating them until rollover purges them for good) — this
+// wrapper is for every human-facing render and "is this time already taken"
+// check, which should never see a deleted slot.
+function visibleSlots(slots) {
+  return normalizeSlots(slots).filter(sl => !sl.deleted);
+}
+
 // ── Payment status + partial-hour helpers ─────────────────────
 // Payment is a simple 2-state flag on each slot/def: paid (true) or unpaid
 // (false, the default). Recurring slots are shown amber regardless of payment
@@ -1421,7 +1434,7 @@ async function confirmBookingImport() {
   // Same guard saveSlotFromModal() applies — catches a same-time duplicate
   // whether from a double-click or a genuine repeat import of one booking.
   const existing = r.slots[0] || [];
-  if (existing.some(sl => sl.s === start && sl.e === end)) { showToast('⚠️ Slot already exists'); return; }
+  if (existing.some(sl => !sl.deleted && sl.s === start && sl.e === end)) { showToast('⚠️ Slot already exists'); return; }
 
   bookingImportInFlight = true;
   try {
@@ -1788,6 +1801,7 @@ function renderGridOccupancy() {
   // that day) don't paint blocks — matches the timeline/dashboard filter.
   const wd = (new Date().getDay() + modalDay) % 7;
   slots.forEach(sl => {
+    if (sl.deleted) return;
     if (sl.recurring && Array.isArray(sl.days) && sl.days.length && !sl.days.includes(wd)) return;
     const [sh, sm] = (sl.s || '').split(':').map(Number);
     const [eh, em] = (sl.e || '').split(':').map(Number);
@@ -1969,7 +1983,7 @@ async function saveSlotFromModal() {
 
   // Check for duplicate slot times — when editing, ignore the slot being edited
   const existing = r.slots[modalDay] || [];
-  const dup = existing.find((sl, idx) => sl.s === s && sl.e === e && !(isEdit && idx === editingSlotIdx));
+  const dup = existing.find((sl, idx) => !sl.deleted && sl.s === s && sl.e === e && !(isEdit && idx === editingSlotIdx));
   if (dup) { showToast('⚠️ Slot already exists'); return; }
 
   const requireCode  = document.getElementById('m_reqcode').checked;
@@ -2609,7 +2623,7 @@ function isSlotTaken(req) {
   if (!room) return true;
   const dayIdx = (req.date === todayStr()) ? 0 : (req.date === tomorrowDateStr() ? 1 : null);
   if (dayIdx === null) return true;
-  return normalizeSlots(room.slots[dayIdx]).some(sl => sl.s === req.s && sl.e === req.e);
+  return visibleSlots(room.slots[dayIdx]).some(sl => sl.s === req.s && sl.e === req.e);
 }
 
 // Once a specific room+date+time is booked (by any means — admin convert
@@ -2640,7 +2654,7 @@ async function declineSiblingRequests(confirmedReq, excludeId, p) {
 // if that room/time is already occupied — caller decides how to surface it.
 async function bookSlotForRequest(id, req, room, dayIdx, date, s, e, p) {
   if (!room.slots[dayIdx]) room.slots[dayIdx] = [];
-  const existing = normalizeSlots(room.slots[dayIdx]);
+  const existing = visibleSlots(room.slots[dayIdx]);
   if (existing.some(sl => sl.s === s && sl.e === e)) return { ok: false };
 
   const newSlot = {
@@ -3670,7 +3684,12 @@ async function pushRoom(idx, profile) {
     // one just adopted from a conflict) this mirrors whatever Firebase
     // already has — see the explicit override below for this device's own
     // writes, which always clear a stale expired flag.
-    expired: !!sl.expired
+    expired: !!sl.expired,
+    // Soft-delete flag (see deleteSlot()) — a tombstoned slot is written
+    // like any other field change so it reaches every device through the
+    // normal merge; visibleSlots() hides it from views, midnight rollover on
+    // the ESP32 is what actually erases it from Firebase.
+    deleted: !!sl.deleted
     // activatedAt/By/attempts/lockedUntil NOT written here — managed
     // exclusively by activateSlot/deactivateSlot/activate.html, and
     // blanket-resetting them on every save would turn off a light someone
@@ -3712,7 +3731,7 @@ async function pushRoom(idx, profile) {
     // treating that as "new" would false-positive a conflict against their
     // own still-current remote twin on every single recurring save.
     if (!remote && sl._fresh && !sl.recurring) {
-      remote = remoteSlotsArr.find(r2 => r2 && !consumedRemote.has(r2) && r2.s === sl.s && r2.e === sl.e);
+      remote = remoteSlotsArr.find(r2 => r2 && !r2.deleted && !consumedRemote.has(r2) && r2.s === sl.s && r2.e === sl.e);
       if (remote) {
         consumedRemote.add(remote);
         // Someone else already booked this exact time since we last synced —
@@ -4075,10 +4094,14 @@ function rolloverRoomLocally(r) {
     });
   // 2. Keep today's own one-time slots that are genuinely still today
   //    (created after an earlier rollover today) — untouched, activation kept.
-  const keptOneTimeToday = todaySlots.filter(sl => !sl.recurring && sl.date === todayDateStr);
-  // 3. Promote only NON-recurring slots from tomorrow (reset activation, date→today).
+  //    A soft-deleted one (see deleteSlot()) is dropped here rather than
+  //    carried forward — this is the permanent purge of an already-tombstoned
+  //    slot the tombstone was waiting for, same as the ESP32's own rollover.
+  const keptOneTimeToday = todaySlots.filter(sl => !sl.recurring && !sl.deleted && sl.date === todayDateStr);
+  // 3. Promote only NON-recurring, non-deleted slots from tomorrow (reset
+  //    activation, date→today). A tombstoned tomorrow slot is purged here too.
   const promoted = tomorrowSlots
-    .filter(sl => !sl.recurring)
+    .filter(sl => !sl.recurring && !sl.deleted)
     .map(sl => ({ ...sl, ...resetFields, date: todayDateStr }));
 
   r.slots[0] = [...regenToday, ...keptOneTimeToday, ...promoted];
@@ -4178,7 +4201,7 @@ function isScheduledNow(room) {
   // A recurring slot only counts today if today's weekday is in its days list
   // (recurringRunsToday); one-time slots and legacy recurring slots (no days)
   // count as before.
-  return (room.slots[0]||[]).some(s =>
+  return (room.slots[0]||[]).some(s => !s.deleted &&
     nm >= toMins(s.s) && nm < toMins(s.e) && (!s.recurring || recurringRunsToday(s)));
 }
 
@@ -4262,10 +4285,22 @@ async function deleteSlot(id, idx) {
   if (!requireLicense('delete a slot')) return;
   const r = state.rooms.find(x => x.id === id);
   const deletedSlot = normalizeSlots(r.slots[state.schedDay])[idx];
-  r.slots[state.schedDay].splice(idx, 1);
+  if (!deletedSlot) return;
+  // Soft delete — same object, same id, just flagged — rather than splicing
+  // it out. This makes delete just another edit that goes through
+  // pushRoom()'s normal id+slotTs merge instead of being represented by
+  // absence, which is what let a delete get silently undone by a sync from
+  // a stale device. slotTs is deliberately left untouched here, same as any
+  // other field edit (see saveSlotFromModal) — it still holds "the value
+  // this device last confirmed was in Firebase", which is what lets
+  // pushRoom() tell a normal write apart from a real conflict; pushRoom
+  // stamps the fresh slotTs itself once the write actually happens.
+  // visibleSlots() hides it everywhere it shouldn't show; midnight rollover
+  // is what actually erases it later.
+  deletedSlot.deleted = true;
   markRoomDirty(id-1);
   persist(); await pushRoom(id-1); renderDashboard(); refreshTimelineIfVisible();
-  if (deletedSlot && deletedSlot.id) await revertRequestForDeletedSlot(id, deletedSlot.id, getActiveProfile());
+  if (deletedSlot.id) await revertRequestForDeletedSlot(id, deletedSlot.id, getActiveProfile());
 }
 
 // Deleting a slot that came from a confirmed booking request leaves that
@@ -4460,13 +4495,14 @@ function copyCandidates(fromRoom) {
   const out = [];
   const day0 = normalizeSlots(fromRoom.slots[0]);
   day0.forEach((sl, idx) => {
+    if (sl.deleted) return;
     // A recurring slot shows when either Today or Recurring is on; a
     // one-time today slot shows only when Today is on.
     const show = sl.recurring ? (wantToday || wantRecurring) : wantToday;
     if (show) out.push({ slot: sl, day: 0, idx });
   });
   if (wantTomorrow) {
-    normalizeSlots(fromRoom.slots[1]).forEach((sl, idx) => out.push({ slot: sl, day: 1, idx }));
+    normalizeSlots(fromRoom.slots[1]).forEach((sl, idx) => { if (!sl.deleted) out.push({ slot: sl, day: 1, idx }); });
   }
   return out;
 }
@@ -4684,8 +4720,17 @@ function renderRoomCard(r) {
   const viewedWeekday = state.schedDay === 0 ? new Date().getDay() : (new Date().getDay() + 1) % 7;
   const slots = (r.slots[state.schedDay] || [])
     .map((s, origIdx) => ({ s, origIdx }))
-    .filter(({ s }) =>
-      !s.recurring || !Array.isArray(s.days) || s.days.length === 0 || s.days.includes(viewedWeekday));
+    .filter(({ s }) => !s.deleted &&
+      (!s.recurring || !Array.isArray(s.days) || s.days.length === 0 || s.days.includes(viewedWeekday)))
+    // Display order only — origIdx (captured above, before this sort) is what
+    // every row action actually uses, so reordering here can never point a
+    // button at the wrong slot. Primary key: start time ("HH:MM" sorts
+    // correctly as a plain string). Tiebreak: slotTs (most recently
+    // modified/created first) for two slots that happen to share a start time.
+    .sort((a, b) => {
+      if (a.s.s !== b.s.s) return a.s.s < b.s.s ? -1 : 1;
+      return (b.s.slotTs || 0) - (a.s.slotTs || 0);
+    });
   let body = '';
 
   if (r.expanded) {
@@ -4870,6 +4915,7 @@ function renderTimeline() {
     const drawBucketBars = (bucketDay, offsetMin) => {
       const tlWeekday = (new Date().getDay() + bucketDay) % 7;
       (room.slots[bucketDay]||[]).forEach((sl, origIdx) => {
+        if (sl.deleted) return;
         if (sl.recurring && Array.isArray(sl.days) && sl.days.length && !sl.days.includes(tlWeekday)) return;
         const sM=toMins(sl.s)+offsetMin, eM=toMins(sl.e)+offsetMin;
         if (eM<=rS||sM>=rE) return;
@@ -4920,7 +4966,7 @@ function renderTimeline() {
   let tlOn=0,tlSlots=0,tlMins=0;
   state.rooms.forEach(r => {
     if (getLightState(r).on) tlOn++;
-    (r.slots[0]||[]).forEach(s => { tlSlots++; tlMins+=toMins(s.e)-toMins(s.s); });
+    (r.slots[0]||[]).forEach(s => { if (s.deleted) return; tlSlots++; tlMins+=toMins(s.e)-toMins(s.s); });
   });
   document.getElementById('tl-on').textContent=tlOn;
   document.getElementById('tl-slots').textContent=tlSlots;
