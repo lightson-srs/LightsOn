@@ -3647,6 +3647,23 @@ async function pollRoomControlsOnce(force) {
     }
 
     if (changed) { persist(); renderDashboard(); }
+
+    // Sync V2 self-heal: the live SSE path can miss the LAST change of a burst
+    // (it arrives mid-sync and is coalesced, or is lost across a reconnect, with
+    // no later event to retrigger). Piggyback a tiny /sync/meta read on this
+    // existing 10 s poll: if the remote revision is ahead of our cursor, catch
+    // up now — so a missed slot activation self-heals within ~10 s without a
+    // reload, and without any full /rooms fallback.
+    const sm = await fbGetOrUndef('/sync/meta', p);
+    if (isActiveProfile(p) && sm && typeof sm === 'object') {
+      const remoteGen = Number(sm.generation || 0);
+      const remoteRev = Number(sm.revision || 0);
+      const localGen = Number(p.pwaSyncGeneration || 0);
+      const localRev = Number(p.pwaSyncRevision || 0);
+      if (remoteGen > 0 && (remoteGen !== localGen || remoteRev > localRev)) {
+        pwaSyncFromMeta(sm, p); // not awaited — it guards its own in-flight state
+      }
+    }
   } finally {
     controlPollInFlight = false;
   }
