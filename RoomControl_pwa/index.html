@@ -2370,9 +2370,12 @@ async function activateSlot(roomId, slotIdx) {
   if (!r) return;
   const localSlot = (r.slots[0] || [])[slotIdx];
   if (!localSlot) { showToast('Slot not found'); return; }
+  // ignoreVersion: activation only toggles activatedAt; no other admin flow
+  // competes for it, so re-read-then-write by id is enough — the slotTs gate
+  // only caused false conflicts against the app's own writeback here.
   const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
     activatedAt: Date.now(), activatedBy: 'admin', attempts: 0, lockedUntil: null, expired: false
-  }, 'slots');
+  }, 'slots', null, { ignoreVersion: true });
   if (!result.ok) { showSlotUpdateError(result, 'activating'); return; }
   const localIdx = (r.slots[0] || []).findIndex(slot => slot && slot.id === localSlot.id);
   if (localIdx >= 0) r.slots[0][localIdx] = { ...result.slot };
@@ -2388,9 +2391,10 @@ async function deactivateSlot(roomId, slotIdx) {
   if (!r) return;
   const localSlot = (r.slots[0] || [])[slotIdx];
   if (!localSlot) { showToast('Slot not found'); return; }
+  // ignoreVersion: see activateSlot — deactivation only clears activatedAt.
   const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
     activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false
-  }, 'slots');
+  }, 'slots', null, { ignoreVersion: true });
   if (!result.ok) { showSlotUpdateError(result, 'deactivating'); return; }
   const localIdx = (r.slots[0] || []).findIndex(slot => slot && slot.id === localSlot.id);
   if (localIdx >= 0) r.slots[0][localIdx] = { ...result.slot };
@@ -4330,9 +4334,19 @@ function showSlotUpdateError(result, actionText) {
   else if (result && result.reason === 'missing_timestamp') showActionToast('⚠️ This slot\'s version timestamp is missing. Reload to fetch it.', 'Reload', () => reloadLatestData('full'));
   else showToast(`⚠️ Could not ${actionText} — check the connection`);
 }
-async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, profile) {
+// opts.ignoreVersion (default false): skip the slotTs equality gate. This
+// function ALWAYS re-reads the slot fresh from /rooms right before writing and
+// writes onto that current remote value — "check that it still exists, then
+// update" — so the version gate only adds protection against a concurrent edit
+// by ANOTHER device. For activate/deactivate (toggling activatedAt, which no
+// other admin flow competes over) that gate produced false "changed on another
+// device" conflicts whenever the app's own async writeback (publishSlotSyncV2 /
+// pushRoom / the SSE echo) advanced /rooms' slotTs between the user's reads.
+// Those callers pass ignoreVersion:true. Edit/paid/code flows keep the gate.
+async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, profile, opts) {
   const p = profile || getActiveProfile();
   const slotBucket = bucket || 'slots';
+  const ignoreVersion = !!(opts && opts.ignoreVersion);
   const roomPath = `/rooms/room${roomId}`;
   const raw = await fbGet(`${roomPath}/${slotBucket}`, p);
   if (raw === null || raw === undefined) return { ok:false, reason:'not_found' };
@@ -4345,15 +4359,19 @@ async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, p
   if (!match) return { ok:false, reason:'not_found' };
   const firebaseKey = match[0], remoteSlot = match[1];
 
-  if (typeof expectedSlotTs !== 'number' || typeof remoteSlot.slotTs !== 'number') {
-    return { ok:false, reason:'missing_timestamp', remote:remoteSlot,
-      expectedSlotTs, actualSlotTs:remoteSlot.slotTs };
-  }
-  if (remoteSlot.slotTs !== expectedSlotTs) {
-    return { ok:false, reason:'conflict', remote:remoteSlot,
-      expectedSlotTs, actualSlotTs:remoteSlot.slotTs };
+  if (!ignoreVersion) {
+    if (typeof expectedSlotTs !== 'number' || typeof remoteSlot.slotTs !== 'number') {
+      return { ok:false, reason:'missing_timestamp', remote:remoteSlot,
+        expectedSlotTs, actualSlotTs:remoteSlot.slotTs };
+    }
+    if (remoteSlot.slotTs !== expectedSlotTs) {
+      return { ok:false, reason:'conflict', remote:remoteSlot,
+        expectedSlotTs, actualSlotTs:remoteSlot.slotTs };
+    }
   }
 
+  // Write onto the FRESH remote slot (not the caller's stale copy), so skipping
+  // the gate never resurrects stale fields — we merge changes over current data.
   const updatedSlot = { ...remoteSlot, ...changes, id:remoteSlot.id, slotTs:Date.now() };
   let writeOk;
   if (slotBucket === 'slots') {
