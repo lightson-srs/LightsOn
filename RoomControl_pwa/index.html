@@ -3425,10 +3425,16 @@ async function pwaSyncCore(meta, p) {
           applied === 'full' ? `FULL_SYNC revision ${revision}` : `invalid revision ${revision}`);
         return;
       }
+      // Advance AND persist the cursor per revision, so the durable cursor never
+      // runs ahead of the data actually applied. If a later revision aborts or
+      // the loop is interrupted, the persisted cursor still points at the last
+      // revision whose change we truly applied — a reload then correctly sees
+      // localRevision < remoteRevision and catches up, instead of concluding
+      // "up to date" on a cursor that outran the data.
       p.pwaSyncGeneration = remoteGeneration;
       p.pwaSyncRevision = revision;
+      persist();
     }
-    persist();
     renderDashboard();
     refreshTimelineIfVisible();
     noteNet(true);
@@ -4158,10 +4164,20 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
       }
       const ok = await fbPatch('/sync', patch, p);
       if (!ok) throw new Error('PATCH /sync failed');
-      // This device already holds its own change, so step its cursor past it so
-      // the SSE echo of this revision isn't re-fetched and re-applied.
+      // This device already holds its OWN change, so step its reader cursor past
+      // it to avoid re-fetching the SSE echo. CRITICAL: only do this when THIS
+      // write builds directly on the cursor — i.e. the revision we just read
+      // (oldMeta.revision) is exactly the cursor. If another device inserted a
+      // revision we never consumed (e.g. our cursor=59 but someone published 60,
+      // so oldMeta.revision=60 and we're writing 61), advancing our cursor would
+      // skip that foreign revision forever: on reload localRevision would equal
+      // remoteRevision and the reader loop would never fetch the change we missed
+      // (the "stuck one revision behind, even after reload" bug). Leaving the
+      // cursor where it is makes the next reader pass fetch and apply every
+      // missing revision, including the foreign one.
       if (!generationChanged && Number(p.pwaSyncGeneration) === generation &&
-          Number(p.pwaSyncRevision) === revision - 1) {
+          Number(p.pwaSyncRevision) === revision - 1 &&
+          Number(oldMeta.revision || 0) === Number(p.pwaSyncRevision)) {
         p.pwaSyncRevision = revision;
       }
       return { revision, generation, updatedAt:now };
