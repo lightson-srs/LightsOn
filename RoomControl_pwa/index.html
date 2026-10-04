@@ -3282,14 +3282,22 @@ async function pwaFullRoomsRefresh(p, meta, reason) {
   // (A room with unsaved local changes — e.g. just added — isn't remote yet.)
   state.rooms = state.rooms.filter(r => seen.has(r.id) || r._dirty);
   if (!state.rooms.length) state.rooms = makeBlankRooms();
-  if (meta) {
-    p.pwaSyncGeneration = Number(meta.generation || 0);
-    p.pwaSyncRevision = Number(meta.revision || 0);
+  // Set the cursor from /sync/meta read AFTER the /rooms pull, for the same
+  // reason as manualSyncFromFirebase: the cursor must never be newer than the
+  // data just pulled. The `meta` passed in was read BEFORE the pull by the
+  // caller; a revision published mid-pull would make that stale-high. Re-read
+  // here so cursor ≤ data (self-heals one-behind on the next poll), never
+  // cursor > data (which strands the device "up to date" with old data).
+  const freshMeta = await fbGet('/sync/meta', p);
+  const useMeta = (freshMeta && typeof freshMeta === 'object' && Number(freshMeta.generation) > 0) ? freshMeta : meta;
+  if (useMeta && isActiveProfile(p)) {
+    p.pwaSyncGeneration = Number(useMeta.generation || 0);
+    p.pwaSyncRevision = Number(useMeta.revision || 0);
   }
   persist();
   renderDashboard();
   refreshTimelineIfVisible();
-  addLog('ok', `Sync V2 full refresh (${reason || 'recovery'})`);
+  addLog('ok', `Sync V2 full refresh (${reason || 'recovery'}) → ${Number((useMeta||{}).generation||0)}/${Number((useMeta||{}).revision||0)}`);
   return true;
 }
 
@@ -3987,11 +3995,6 @@ async function manualSyncFromFirebase(opts) {
     }
 
     // ── 2. PULL authoritative copy back and replace local ──
-    // Read the Sync V2 head BEFORE the data: the pull below is at least as new as
-    // this revision, so recording it as the cursor can only cause an idempotent
-    // re-apply of a change, never skip one. Without it the cursor stayed at its
-    // old value and the next live event replayed every change since.
-    const metaBeforePull = silent ? null : await fbGet('/sync/meta', p);
     const data = await fbGet('/rooms', p);
     if (!isActiveProfile(p)) return; // switched profile mid-pull: state.rooms is no longer this profile's
     if (!data || typeof data !== 'object') {
@@ -4057,10 +4060,21 @@ async function manualSyncFromFirebase(opts) {
         }
       } catch (e) { /* non-critical — header just keeps the local name */ }
     }
-    if (metaBeforePull && typeof metaBeforePull === 'object' && isActiveProfile(p) &&
-        Number(metaBeforePull.generation) > 0) {
-      p.pwaSyncGeneration = Number(metaBeforePull.generation);
-      p.pwaSyncRevision = Number(metaBeforePull.revision || 0);
+    // Set the cursor from /sync/meta read AFTER the /rooms pull. Reading it
+    // AFTER (not before) guarantees the cursor is never NEWER than the data we
+    // just pulled: if another device published a revision mid-pull, worst case
+    // our data already includes it and our cursor is one behind (self-heals on
+    // the next poll) — the SAFE direction. Reading meta BEFORE the pull did the
+    // opposite: it could stamp a cursor that matched Firebase's head while our
+    // data predated it, so a later reload saw "up to date" and never caught up
+    // (the one-revision-behind-after-reload bug). The Sync button does NOT bump
+    // the revision — it's a read/catch-up, it changes no shared data, so other
+    // devices must not be forced to refresh by it.
+    const metaAfterPull = silent ? null : await fbGet('/sync/meta', p);
+    if (metaAfterPull && typeof metaAfterPull === 'object' && isActiveProfile(p) &&
+        Number(metaAfterPull.generation) > 0) {
+      p.pwaSyncGeneration = Number(metaAfterPull.generation);
+      p.pwaSyncRevision = Number(metaAfterPull.revision || 0);
     }
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
