@@ -3570,6 +3570,7 @@ function resumeConnection() {
   // the catch-up sync — no separate /sync/meta read needed.
   if (!fbListener || Date.now() - sseLastEvent > 60000) startFbListener();
   pollRoomControlsOnce(true);
+  reconcileAllSlotStatusesFromRooms(p); // catch an activation made elsewhere while we were away
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeConnection(); });
 window.addEventListener('online', resumeConnection);
@@ -3697,6 +3698,44 @@ async function refreshRoomSlotStatusesById(roomId) {
   });
   if (changed) { persist(); renderDashboard(); refreshTimelineIfVisible(); }
 }
+
+// Reconcile every room's slot ACTIVATION state from /rooms in ONE read.
+// Activate/deactivate changes a slot's activatedAt in /rooms and publishes a
+// Sync V2 delta. But the incremental reload path (startPwaSyncV2 -> pwaSyncCore)
+// only applies deltas when the revision advanced; if the publish didn't bump the
+// revision for any reason, a second PWA's plain page load would see "up to date"
+// and never pick up the activation (only a manual full-pull Sync did). This runs
+// on load (and on resume) as a cheap, cursor-independent safety net: it reads
+// each room's /rooms slots once and copies only the activation sub-fields onto
+// the slots we already hold — never structure — so it can't resurrect stale
+// slots or fight the Sync V2 merge. One /rooms GET total.
+async function reconcileAllSlotStatusesFromRooms(profile) {
+  const p = profile || getActiveProfile();
+  if (!p || !p.dbUrl) return;
+  const data = await fbGet('/rooms', p);
+  if (!isActiveProfile(p) || !data || typeof data !== 'object') return;
+  let changed = false;
+  Object.keys(data).forEach(key => {
+    const m = key.match(/^room(\d+)$/);
+    if (!m) return;
+    const room = state.rooms.find(r => r.id === parseInt(m[1], 10));
+    if (!room || room._dirty) return; // don't stomp an unsaved local edit
+    ['slots', 'slotsT'].forEach((bucketKey, bucketIdx) => {
+      normalizeSlots(data[key] && data[key][bucketKey]).forEach(remoteSlot => {
+        if (!remoteSlot || !remoteSlot.id) return;
+        const localSlot = (room.slots[bucketIdx] || []).find(s => s && s.id === remoteSlot.id);
+        if (!localSlot) return;
+        ['activatedAt', 'activatedBy', 'attempts', 'lockedUntil', 'expired'].forEach(f => {
+          if (remoteSlot[f] !== undefined && localSlot[f] !== remoteSlot[f]) {
+            localSlot[f] = remoteSlot[f]; changed = true;
+          }
+        });
+      });
+    });
+  });
+  if (changed) { persist(); renderDashboard(); refreshTimelineIfVisible(); }
+}
+
 function applyFirebasePathUpdate(path, value) {
   const segments = (path || '/').split('/').filter(Boolean);
 
@@ -6992,6 +7031,7 @@ function bootApp() {
     startPwaSyncV2(); // cache-first: /sync/meta, then only missing deltas/canonical records
     checkDailySlotRefresh(getActiveProfile()); // full /rooms only when rollover marker changed
     refreshControllerStatus(); // initial board-health read
+    reconcileAllSlotStatusesFromRooms(getActiveProfile()); // reflect another device's activation on load
   }
   renderDashboard();
 
