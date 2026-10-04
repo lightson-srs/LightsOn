@@ -3570,7 +3570,6 @@ function resumeConnection() {
   // the catch-up sync — no separate /sync/meta read needed.
   if (!fbListener || Date.now() - sseLastEvent > 60000) startFbListener();
   pollRoomControlsOnce(true);
-  reconcileAllSlotStatusesFromRooms(p); // catch an activation made elsewhere while we were away
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeConnection(); });
 window.addEventListener('online', resumeConnection);
@@ -3694,43 +3693,6 @@ async function refreshRoomSlotStatusesById(roomId) {
       if (remoteSlot[fieldName] !== undefined && localSlot[fieldName] !== remoteSlot[fieldName]) {
         localSlot[fieldName] = remoteSlot[fieldName]; changed = true;
       }
-    });
-  });
-  if (changed) { persist(); renderDashboard(); refreshTimelineIfVisible(); }
-}
-
-// Reconcile every room's slot ACTIVATION state from /rooms in ONE read.
-// Activate/deactivate changes a slot's activatedAt in /rooms and publishes a
-// Sync V2 delta. But the incremental reload path (startPwaSyncV2 -> pwaSyncCore)
-// only applies deltas when the revision advanced; if the publish didn't bump the
-// revision for any reason, a second PWA's plain page load would see "up to date"
-// and never pick up the activation (only a manual full-pull Sync did). This runs
-// on load (and on resume) as a cheap, cursor-independent safety net: it reads
-// each room's /rooms slots once and copies only the activation sub-fields onto
-// the slots we already hold — never structure — so it can't resurrect stale
-// slots or fight the Sync V2 merge. One /rooms GET total.
-async function reconcileAllSlotStatusesFromRooms(profile) {
-  const p = profile || getActiveProfile();
-  if (!p || !p.dbUrl) return;
-  const data = await fbGet('/rooms', p);
-  if (!isActiveProfile(p) || !data || typeof data !== 'object') return;
-  let changed = false;
-  Object.keys(data).forEach(key => {
-    const m = key.match(/^room(\d+)$/);
-    if (!m) return;
-    const room = state.rooms.find(r => r.id === parseInt(m[1], 10));
-    if (!room || room._dirty) return; // don't stomp an unsaved local edit
-    ['slots', 'slotsT'].forEach((bucketKey, bucketIdx) => {
-      normalizeSlots(data[key] && data[key][bucketKey]).forEach(remoteSlot => {
-        if (!remoteSlot || !remoteSlot.id) return;
-        const localSlot = (room.slots[bucketIdx] || []).find(s => s && s.id === remoteSlot.id);
-        if (!localSlot) return;
-        ['activatedAt', 'activatedBy', 'attempts', 'lockedUntil', 'expired'].forEach(f => {
-          if (remoteSlot[f] !== undefined && localSlot[f] !== remoteSlot[f]) {
-            localSlot[f] = remoteSlot[f]; changed = true;
-          }
-        });
-      });
     });
   });
   if (changed) { persist(); renderDashboard(); refreshTimelineIfVisible(); }
@@ -4366,6 +4328,9 @@ function showSlotUpdateError(result, actionText) {
   if (result && result.reason === 'conflict') showActionToast(`⚠️ This slot changed on another device (version mismatch). Reload to get the latest before you ${actionText}.`, 'Reload', () => reloadLatestData('auto'));
   else if (result && result.reason === 'not_found') showActionToast('⚠️ This slot no longer exists in Firebase. Reload to get the latest.', 'Reload', () => reloadLatestData('full'));
   else if (result && result.reason === 'missing_timestamp') showActionToast('⚠️ This slot\'s version timestamp is missing. Reload to fetch it.', 'Reload', () => reloadLatestData('full'));
+  // sync_write_failed: publish-first means NOTHING was written when this fires —
+  // the change wasn't applied anywhere, so the user just tries again.
+  else if (result && result.reason === 'sync_write_failed') showToast(`⚠️ Could not ${actionText} — connection issue, please try again`);
   else showToast(`⚠️ Could not ${actionText} — check the connection`);
 }
 // opts.ignoreVersion (default false): skip the slotTs equality gate. This
@@ -4407,29 +4372,46 @@ async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, p
   // Write onto the FRESH remote slot (not the caller's stale copy), so skipping
   // the gate never resurrects stale fields — we merge changes over current data.
   const updatedSlot = { ...remoteSlot, ...changes, id:remoteSlot.id, slotTs:Date.now() };
-  let writeOk;
-  if (slotBucket === 'slots') {
-    writeOk = await writeRoomSlots(roomId, { [firebaseKey]: updatedSlot }, p);
-  } else {
-    await bumpRoomsUpdatedAt(p);
-    writeOk = await fbPatch(roomPath, { [`${slotBucket}/${firebaseKey}`]: updatedSlot }, p);
-  }
-  if (!writeOk) return { ok:false, reason:'write_failed' };
-  // The authoritative write to /rooms has already succeeded — the slot IS
-  // changed. publishSlotSyncV2 is a SECONDARY step that bumps the Sync V2
-  // revision so the change propagates as a delta; the ESP32 and other PWAs
-  // still pick the change up from /rooms on their next full refresh even if it
-  // fails. So a failed publish must NOT report the whole action as failed (that
-  // was the "Could not activate" message the user saw AFTER the status had in
-  // fact changed). Treat it as a non-fatal warning: return ok with the slot we
-  // wrote, flagging syncWarning so the caller can note it.
+
+  // Transactional write: /rooms and the Sync V2 change log must stay consistent,
+  // because the ESP32 and other PWAs drive off Sync V2 (its revision cursor),
+  // NOT off /rooms directly, once Sync V2 exists. If we wrote /rooms but failed
+  // to publish the Sync V2 delta, the slot would change in /rooms yet never
+  // reach the ESP32 — the exact divergence we must avoid, and relying on a
+  // /rooms fallback would defeat the whole point of the delta optimization.
+  //
+  // ORDER: publish Sync V2 FIRST, then write /rooms. If the publish fails we
+  // haven't touched /rooms at all — nothing to revert, no half-applied state,
+  // no double-failure window. This is safe because the ESP32/PWA consume a slot
+  // delta by reading the canonical from /slotRecords (which publishSlotSyncV2
+  // writes), so between the publish and the /rooms write the delta is already
+  // self-contained. The /rooms write that follows just keeps /rooms (the
+  // authoritative full-refresh source) in step. If the /rooms write then fails,
+  // the Sync V2 delta already carried the change, and /rooms is reconciled on
+  // the next full refresh — the one direction that's safe to be eventually
+  // consistent, since no reader is driven off /rooms while Sync V2 is current.
   const canonical = await publishSlotSyncV2(
     roomId, slotBucket, updatedSlot,
     updatedSlot.deleted ? 'delete' : 'update', p
   );
   if (!canonical) {
-    addLog('error', `room${roomId} slot ${slotId}: /rooms updated but Sync V2 publish failed — change still saved, will propagate on next full refresh`);
-    return { ok:true, firebaseKey, slot:updatedSlot, slotTs:updatedSlot.slotTs, syncWarning:true };
+    addLog('error', `room${roomId} slot ${slotId}: Sync V2 publish failed — change NOT applied, please try again`);
+    return { ok:false, reason:'sync_write_failed' };
+  }
+
+  // Publish succeeded. Mirror the SAME canonical record to /rooms so the two
+  // stores are byte-identical (same slotTs/version — the slotTs invariant). A
+  // failure here is logged but non-fatal: the authoritative delta is already
+  // published, and /rooms catches up on the next full refresh.
+  let writeOk;
+  if (slotBucket === 'slots') {
+    writeOk = await writeRoomSlots(roomId, { [firebaseKey]: canonical }, p);
+  } else {
+    await bumpRoomsUpdatedAt(p);
+    writeOk = await fbPatch(roomPath, { [`${slotBucket}/${firebaseKey}`]: canonical }, p);
+  }
+  if (!writeOk) {
+    addLog('error', `room${roomId} slot ${slotId}: Sync V2 published but /rooms mirror write failed — will reconcile on next full refresh`);
   }
   return { ok:true, firebaseKey, slot:canonical, slotTs:canonical.slotTs };
 }
@@ -7031,7 +7013,6 @@ function bootApp() {
     startPwaSyncV2(); // cache-first: /sync/meta, then only missing deltas/canonical records
     checkDailySlotRefresh(getActiveProfile()); // full /rooms only when rollover marker changed
     refreshControllerStatus(); // initial board-health read
-    reconcileAllSlotStatusesFromRooms(getActiveProfile()); // reflect another device's activation on load
   }
   renderDashboard();
 
