@@ -3407,10 +3407,15 @@ async function pwaSyncCore(meta, p) {
       return;
     }
     if (localRevision === remoteRevision) {
+      // DIAGNOSTIC: shows what this device read as the remote head vs its cursor.
+      // If a device that should catch up logs "up to date rev=63" while another
+      // device published 64, the remote /sync/meta read is stale, not the cursor.
+      addLog('ok', `Sync V2 up to date — local=${localGeneration}/${localRevision} remote=${remoteGeneration}/${remoteRevision}`);
       noteNet(true);
       return;
     }
 
+    addLog('ok', `Sync V2 catching up — local rev ${localRevision} → remote rev ${remoteRevision}`);
     for (let revision = localRevision + 1; revision <= remoteRevision; revision++) {
       const change = await fbGet(`/sync/changes/${revision}`, p);
       if (!isActiveProfile(p)) return;
@@ -4181,6 +4186,8 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
       }
       const ok = await fbPatch('/sync', patch, p);
       if (!ok) throw new Error('PATCH /sync failed');
+      // DIAGNOSTIC: confirm what we told /sync/meta the head revision is.
+      addLog('ok', `Sync V2 published rev ${revision} (meta/revision set to ${revision})`);
       // This device already holds its OWN change, so step its reader cursor past
       // it to avoid re-fetching the SSE echo. CRITICAL: only do this when THIS
       // write builds directly on the cursor — i.e. the revision we just read
