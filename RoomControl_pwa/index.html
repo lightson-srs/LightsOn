@@ -4129,8 +4129,15 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
         headers:{ 'Accept':'application/json', 'X-Firebase-ETag':'true' }
       });
       if (!readRes.ok) throw new Error(await readRes.text());
+      // The ETag is only readable by JS when the server exposes it via CORS
+      // (Access-Control-Expose-Headers). Some Firebase setups don't surface it
+      // to the page, in which case the atomic If-Match path is impossible.
+      // Rather than fail the whole publish (which made activation report "Could
+      // not activate" even though /rooms already changed), fall back to a plain
+      // conditional-free append: read the current revision, write the next one.
+      // Loses strict multi-writer atomicity, but the change still propagates;
+      // the ESP32/other PWAs reconcile via their next full refresh on any gap.
       const etag = readRes.headers.get('ETag');
-      if (!etag) throw new Error('Firebase did not return an ETag for /sync');
       const sync = (await readRes.json()) || {};
       const oldMeta = sync.meta || {};
       const generationChanged = Number(oldMeta.generation) !== generation;
@@ -4149,9 +4156,11 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
         patch['meta/revision'] = revision;
         patch['meta/updatedAt'] = now;
       }
+      const writeHeaders = { 'Content-Type':'application/json', 'Accept':'application/json' };
+      if (etag) writeHeaders['If-Match'] = etag; // atomic when we have it, best-effort otherwise
       const writeRes = await fetch(fbUrl('/sync', p), {
         method:'PATCH',
-        headers:{ 'Content-Type':'application/json', 'Accept':'application/json', 'If-Match':etag },
+        headers: writeHeaders,
         body:JSON.stringify(patch)
       });
       if (writeRes.status === 412) {
@@ -4255,8 +4264,10 @@ async function resetDailySyncV2(profile, reason) {
         method:'GET', cache:'no-store', headers:{'Accept':'application/json','X-Firebase-ETag':'true'}
       });
       if (!readRes.ok) throw new Error(await readRes.text());
+      // ETag may be unreadable to JS (CORS) in some Firebase setups — fall back
+      // to a conditional-free PUT rather than failing the reset. See the same
+      // note in appendSyncV2ChangeAtomic.
       const etag = readRes.headers.get('ETag');
-      if (!etag) throw new Error('Firebase did not return an ETag for /sync reset');
       // After a lost race (412) another writer may already have reset this
       // generation (and appended changes on top). Replacing /sync again would
       // wipe their revisions, so if a reset for OUR generation landed after we
@@ -4269,8 +4280,10 @@ async function resetDailySyncV2(profile, reason) {
         meta:{schemaVersion:2,generation,revision:1,resetAt:now,resetReason:reason||'midnight_rollover',updatedAt:now},
         changes:{'1':{type:'FULL_SYNC',reason:reason||'midnight_rollover',generation,updatedAt:now}}
       };
+      const resetHeaders={'Content-Type':'application/json','Accept':'application/json'};
+      if (etag) resetHeaders['If-Match']=etag;
       const writeRes=await fetch(fbUrl('/sync',p),{
-        method:'PUT',headers:{'Content-Type':'application/json','Accept':'application/json','If-Match':etag},
+        method:'PUT',headers:resetHeaders,
         body:JSON.stringify(replacement)
       });
       if (writeRes.status===412) {
@@ -4381,11 +4394,22 @@ async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, p
     writeOk = await fbPatch(roomPath, { [`${slotBucket}/${firebaseKey}`]: updatedSlot }, p);
   }
   if (!writeOk) return { ok:false, reason:'write_failed' };
+  // The authoritative write to /rooms has already succeeded — the slot IS
+  // changed. publishSlotSyncV2 is a SECONDARY step that bumps the Sync V2
+  // revision so the change propagates as a delta; the ESP32 and other PWAs
+  // still pick the change up from /rooms on their next full refresh even if it
+  // fails. So a failed publish must NOT report the whole action as failed (that
+  // was the "Could not activate" message the user saw AFTER the status had in
+  // fact changed). Treat it as a non-fatal warning: return ok with the slot we
+  // wrote, flagging syncWarning so the caller can note it.
   const canonical = await publishSlotSyncV2(
     roomId, slotBucket, updatedSlot,
     updatedSlot.deleted ? 'delete' : 'update', p
   );
-  if (!canonical) return { ok:false, reason:'sync_write_failed' };
+  if (!canonical) {
+    addLog('error', `room${roomId} slot ${slotId}: /rooms updated but Sync V2 publish failed — change still saved, will propagate on next full refresh`);
+    return { ok:true, firebaseKey, slot:updatedSlot, slotTs:updatedSlot.slotTs, syncWarning:true };
+  }
   return { ok:true, firebaseKey, slot:canonical, slotTs:canonical.slotTs };
 }
 async function pushRoom(idx, profile) {

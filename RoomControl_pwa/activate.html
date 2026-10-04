@@ -288,8 +288,9 @@ async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatc
         headers: { 'Accept': 'application/json', 'X-Firebase-ETag': 'true' }
       });
       if (!readRes.ok) throw new Error('HTTP ' + readRes.status);
+      // ETag may be unreadable to JS (CORS) in some setups — fall back to a
+      // conditional-free append rather than failing the activation sync.
       const etag = readRes.headers.get('ETag');
-      if (!etag) throw new Error('no ETag for /sync');
       const sync = (await readRes.json()) || {};
       const oldMeta = sync.meta || {};
       const generationChanged = Number(oldMeta.generation) !== generation;
@@ -311,9 +312,11 @@ async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatc
         patch['meta/revision'] = revision;
         patch['meta/updatedAt'] = now;
       }
+      const writeHeaders = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+      if (etag) writeHeaders['If-Match'] = etag;
       const writeRes = await fetch(syncUrl, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'If-Match': etag },
+        headers: writeHeaders,
         body: JSON.stringify(patch)
       });
       if (writeRes.status === 412) {
