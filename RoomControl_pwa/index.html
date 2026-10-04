@@ -3317,10 +3317,17 @@ async function applyPwaSyncV2Change(revision, change, p) {
     // we hold instead of replacing (which erased start/end). A partial record
     // for a slot we don't have can't be built into a slot → full refresh.
     const hasTimes = typeof canonical.s === 'string' && typeof canonical.e === 'string';
+    // Defense-in-depth for the optimistic-lock token: updateSlotById() checks a
+    // slot's /rooms slotTs. For a slot we ALREADY hold, don't let the /slotRecords
+    // copy's slotTs overwrite local — refreshRoomSlotStatusesById() keeps local
+    // slotTs tracking /rooms, the store the version check reads. (A brand-new slot
+    // has no /rooms baseline yet, so it keeps the canonical slotTs.) This stops a
+    // store that stamped slotTs on only one side from causing a false conflict.
+    const mergeExisting = c => { const m = { ...list[idx], ...c }; m.slotTs = list[idx].slotTs; return m; };
     if (canonical.deleted || change.operation === 'delete') {
-      if (idx >= 0) list[idx] = { ...list[idx], ...canonical, deleted:true };
+      if (idx >= 0) list[idx] = { ...mergeExisting(canonical), deleted:true };
       else if (hasTimes) list.push({ ...canonical, deleted:true });
-    } else if (idx >= 0) list[idx] = { ...list[idx], ...canonical };
+    } else if (idx >= 0) list[idx] = mergeExisting(canonical);
     else if (hasTimes) list.push(canonical);
     else return false;
     room.slots[bucket] = ensureSlotIds(list);

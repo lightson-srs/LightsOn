@@ -253,7 +253,7 @@ function syncRoomId(roomKey) {
   const m = String(roomKey || '').match(/room(\d+)/);
   return m ? Number(m[1]) : String(roomKey || '');
 }
-async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatch) {
+async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatch, slotTs) {
   try {
     const generation = syncGenerationToday();
     const canonicalBucket = syncBucketName(bucket);
@@ -262,8 +262,10 @@ async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatc
 
     // 1) Data first, pointer second (same order as index.html): a reader that
     //    sees the new revision can always find the record it points at.
+    //    Use the caller's slotTs when given so /slotRecords matches the /rooms
+    //    copy exactly (see the activation block) — otherwise stamp our own.
     if (slotPatch) {
-      const ts = Date.now();
+      const ts = (typeof slotTs === 'number') ? slotTs : Date.now();
       const dataPatch = {};
       Object.keys(slotPatch).forEach(k => { dataPatch[`${recordPath}/${k}`] = slotPatch[k]; });
       dataPatch[`${recordPath}/id`] = slotId;
@@ -725,17 +727,27 @@ async function pinSubmit() {
 
       const activatedAt = Date.now();
       const activatedBy = isAdmin ? 'admin' : 'slot';
+      // ONE slotTs stamped on BOTH stores. The admin PWA's updateSlotById()
+      // version-checks a slot's /rooms slotTs against the value it last saw —
+      // which it may have picked up from /slotRecords via a Sync V2 delta. If
+      // this page bumped only /slotRecords' slotTs (as it used to), /rooms kept
+      // the old one, and the admin's next edit saw a false "changed on another
+      // device" conflict. Writing the same slotTs to /rooms keeps them equal.
+      const slotTs = Date.now();
       const a1 = await fbPut(slotBasePath + '/activatedAt', activatedAt);
       const a2 = await fbPut(slotBasePath + '/activatedBy', activatedBy);
       const a3 = await fbPut(slotBasePath + '/attempts',    0);
       const a4 = await fbPut(slotBasePath + '/lockedUntil', null);
-      if (!(a1 && a2 && a3 && a4)) throw new Error('Activation write failed');
+      const a5 = await fbPut(slotBasePath + '/slotTs',      slotTs);
+      if (!(a1 && a2 && a3 && a4 && a5)) throw new Error('Activation write failed');
 
       // Write the canonical ID-keyed state and bump Sync V2 revision so the
       // ESP32 retrieves exactly this changed slot on its next delta poll.
+      // Pass the SAME slotTs so /slotRecords matches /rooms exactly.
       const syncOk = await appendSlotSyncChange(
         selectedSlot.roomKey, bucket, selectedSlot.id, 'update',
-        { activatedAt, activatedBy, attempts: 0, lockedUntil: null, expired: false }
+        { activatedAt, activatedBy, attempts: 0, lockedUntil: null, expired: false },
+        slotTs
       );
       if (!syncOk) throw new Error('Activation sync record failed');
 
@@ -772,8 +784,12 @@ async function pinSubmit() {
       const slotPath2 = `/rooms/${selectedSlot.roomKey}/${bucket2}/${freshIdx2}`;
       const currentAttempts = freshSlot2.attempts || 0;
       const attempts = currentAttempts + 1;
+      // Same shared-slotTs rule as the success branch: bump /rooms' slotTs with
+      // the attempt so it stays equal to the /slotRecords copy appendSlotSyncChange writes.
+      const attemptTs = Date.now();
       const attemptsOk = await fbPut(slotPath2 + '/attempts', attempts);
-      if (!attemptsOk) throw new Error('Attempt counter write failed');
+      const attemptTsOk = await fbPut(slotPath2 + '/slotTs', attemptTs);
+      if (!(attemptsOk && attemptTsOk)) throw new Error('Attempt counter write failed');
 
       let lockUntil = null;
       if (attempts >= 3) {
@@ -793,7 +809,7 @@ async function pinSubmit() {
 
       const attemptSyncOk = await appendSlotSyncChange(
         selectedSlot.roomKey, bucket2, selectedSlot.id, 'update',
-        { attempts, lockedUntil }
+        { attempts, lockedUntil }, attemptTs
       );
       if (!attemptSyncOk) throw new Error('Attempt sync record failed');
 
