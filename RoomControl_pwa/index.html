@@ -4118,27 +4118,26 @@ function syncV2GenerationToday() {
   return Number(String(d.getUTCFullYear()) + String(d.getUTCMonth()+1).padStart(2,'0') + String(d.getUTCDate()).padStart(2,'0'));
 }
 function syncV2Bucket(bucket) { return bucket === 'slotsT' || bucket === 1 ? 'tomorrow' : 'today'; }
+// Append one Sync V2 change and advance the revision.
+//
+// NOTE on atomicity: Firebase RTDB's REST API only accepts the `If-Match`
+// (ETag) conditional header on PUT and DELETE — it REJECTS it on PATCH with
+// "The 'if-match' header is not supported with GET, PATCH or POST requests".
+// The earlier design used If-Match on a PATCH, so EVERY append failed. This is
+// a plain read-then-PATCH: read the current revision, write the next one. Two
+// devices appending at the exact same instant could pick the same revision
+// number and one would overwrite the other's change entry — but the readers
+// (ESP32 syncSlotsV2, PWA pwaSyncCore) detect a revision gap and fall back to a
+// full /rooms refresh, so a lost entry self-heals and never corrupts state. In
+// this deployment the admin PWA is effectively the single writer, so even that
+// is rare. A couple of retries cover a transient read/write error.
 async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
   const p = profile || getActiveProfile();
   const generation = syncV2GenerationToday();
-  const maxAttempts = 8;
+  const maxAttempts = 4;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      const readRes = await fetch(fbUrl('/sync', p) + '?nc=' + Date.now() + '_' + attempt, {
-        method:'GET', cache:'no-store',
-        headers:{ 'Accept':'application/json', 'X-Firebase-ETag':'true' }
-      });
-      if (!readRes.ok) throw new Error(await readRes.text());
-      // The ETag is only readable by JS when the server exposes it via CORS
-      // (Access-Control-Expose-Headers). Some Firebase setups don't surface it
-      // to the page, in which case the atomic If-Match path is impossible.
-      // Rather than fail the whole publish (which made activation report "Could
-      // not activate" even though /rooms already changed), fall back to a plain
-      // conditional-free append: read the current revision, write the next one.
-      // Loses strict multi-writer atomicity, but the change still propagates;
-      // the ESP32/other PWAs reconcile via their next full refresh on any gap.
-      const etag = readRes.headers.get('ETag');
-      const sync = (await readRes.json()) || {};
+      const sync = (await fbGet('/sync', p)) || {};
       const oldMeta = sync.meta || {};
       const generationChanged = Number(oldMeta.generation) !== generation;
       const now = Date.now();
@@ -4156,23 +4155,10 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
         patch['meta/revision'] = revision;
         patch['meta/updatedAt'] = now;
       }
-      const writeHeaders = { 'Content-Type':'application/json', 'Accept':'application/json' };
-      if (etag) writeHeaders['If-Match'] = etag; // atomic when we have it, best-effort otherwise
-      const writeRes = await fetch(fbUrl('/sync', p), {
-        method:'PATCH',
-        headers: writeHeaders,
-        body:JSON.stringify(patch)
-      });
-      if (writeRes.status === 412) {
-        await new Promise(resolve => setTimeout(resolve, 35 + Math.floor(Math.random()*90)));
-        continue;
-      }
-      if (!writeRes.ok) throw new Error(await writeRes.text());
-      // This device already holds its own change, so step its cursor past it.
-      // Without this, the revision came straight back over SSE and was fetched
-      // and re-applied — a roomSnapshot re-apply replaced the whole room and
-      // could overwrite edits made in the meantime. (Only when the cursor was
-      // exactly current; after a generation change others need a full refresh.)
+      const ok = await fbPatch('/sync', patch, p);
+      if (!ok) throw new Error('PATCH /sync failed');
+      // This device already holds its own change, so step its cursor past it so
+      // the SSE echo of this revision isn't re-fetched and re-applied.
       if (!generationChanged && Number(p.pwaSyncGeneration) === generation &&
           Number(p.pwaSyncRevision) === revision - 1) {
         p.pwaSyncRevision = revision;
@@ -4180,16 +4166,12 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
       return { revision, generation, updatedAt:now };
     } catch(e) {
       if (attempt === maxAttempts - 1) {
-        addLog('error', 'Sync V2 atomic revision failed: ' + e.message);
-        noteNet(false);
+        addLog('error', 'Sync V2 revision append failed: ' + e.message);
         return null;
       }
       await new Promise(resolve => setTimeout(resolve, 60 + Math.floor(Math.random()*140)));
     }
   }
-  // Every attempt lost the ETag race (412) — heavy contention. This used to
-  // return silently, so the caller reported a vague failure with nothing logged.
-  addLog('error', `Sync V2 revision not committed after ${maxAttempts} contended attempts`);
   return null;
 }
 

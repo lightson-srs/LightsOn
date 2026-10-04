@@ -278,14 +278,15 @@ async function publishSlotSync(roomId, bucketName, slot) {
     const now0 = Date.now();
     const canonical = { ...slot, version: 1, updatedAt: now0, deleted: false };
     if (!await fbPut('/slotRecords/room' + roomId + '/' + bucketName + '/' + slot.id, canonical)) return false;
+    // Read-then-PATCH. Firebase RTDB rejects If-Match on PATCH, so no
+    // conditional write here; a concurrent appender is self-healed by the
+    // readers' revision-gap full-refresh fallback.
     const syncUrl = FIREBASE_URL + PROFILE_PREFIX + '/sync.json';
-    for (let attempt = 0; attempt < 8; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       const readRes = await fetch(syncUrl + '?nc=' + Date.now() + '_' + attempt, {
-        cache: 'no-store', headers: { 'Accept': 'application/json', 'X-Firebase-ETag': 'true' }
+        cache: 'no-store', headers: { 'Accept': 'application/json' }
       });
       if (!readRes.ok) return false;
-      const etag = readRes.headers.get('ETag');
-      if (!etag) return false;
       const sync = (await readRes.json()) || {};
       const oldMeta = sync.meta || {};
       const generationChanged = Number(oldMeta.generation) !== generation;
@@ -304,11 +305,11 @@ async function publishSlotSync(roomId, bucketName, slot) {
       }
       const w = await fetch(syncUrl, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'If-Match': etag },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(patch)
       });
-      if (w.status === 412) { await new Promise(r => setTimeout(r, 35 + Math.floor(Math.random() * 90))); continue; }
-      return w.ok;
+      if (!w.ok) { if (attempt < 3) { await new Promise(r => setTimeout(r, 60 + Math.floor(Math.random() * 120))); continue; } return false; }
+      return true;
     }
     return false;
   } catch(e) { return false; }

@@ -274,23 +274,20 @@ async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatc
       if (!await fbPatch('/', dataPatch)) return false;
     }
 
-    // 2) Allocate the revision atomically. This used to read /sync/meta and then
-    //    write revision+1 with no condition, so it could overwrite the SAME
-    //    changes/N that the admin PWA committed at the same moment — a lost
-    //    change nobody can detect. Firebase's ETag + If-Match makes the write
-    //    fail with 412 if /sync changed since we read it; we then re-read and
-    //    take the next revision (identical protocol to appendSyncV2ChangeAtomic).
+    // 2) Allocate the revision: read current, write next. Firebase RTDB's REST
+    //    API rejects the If-Match (ETag) header on PATCH ("not supported with
+    //    ... PATCH"), so there's no conditional-write option here — this is a
+    //    plain read-then-PATCH. A concurrent appender could pick the same
+    //    revision; the readers (ESP32, admin PWA) detect a revision gap and do a
+    //    full /rooms refresh, so a lost entry self-heals rather than corrupting.
     const syncUrl = FIREBASE_URL + PROFILE_PREFIX + '/sync.json';
-    const maxAttempts = 8;
+    const maxAttempts = 4;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const readRes = await fetch(syncUrl + '?nc=' + Date.now() + '_' + attempt, {
         cache: 'no-store',
-        headers: { 'Accept': 'application/json', 'X-Firebase-ETag': 'true' }
+        headers: { 'Accept': 'application/json' }
       });
       if (!readRes.ok) throw new Error('HTTP ' + readRes.status);
-      // ETag may be unreadable to JS (CORS) in some setups — fall back to a
-      // conditional-free append rather than failing the activation sync.
-      const etag = readRes.headers.get('ETag');
       const sync = (await readRes.json()) || {};
       const oldMeta = sync.meta || {};
       const generationChanged = Number(oldMeta.generation) !== generation;
@@ -312,18 +309,15 @@ async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatc
         patch['meta/revision'] = revision;
         patch['meta/updatedAt'] = now;
       }
-      const writeHeaders = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
-      if (etag) writeHeaders['If-Match'] = etag;
       const writeRes = await fetch(syncUrl, {
         method: 'PATCH',
-        headers: writeHeaders,
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(patch)
       });
-      if (writeRes.status === 412) {
-        await new Promise(r => setTimeout(r, 35 + Math.floor(Math.random() * 90)));
-        continue;
+      if (!writeRes.ok) {
+        if (attempt < maxAttempts - 1) { await new Promise(r => setTimeout(r, 60 + Math.floor(Math.random() * 120))); continue; }
+        throw new Error('HTTP ' + writeRes.status);
       }
-      if (!writeRes.ok) throw new Error('HTTP ' + writeRes.status);
       return true;
     }
     console.warn('Sync V2 revision not committed after contended attempts');
