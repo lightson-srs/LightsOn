@@ -52,7 +52,7 @@ itself, not from editing code.
 PWA App (any device)
       ↓ writes rooms, pins, schedule, override
 Firebase Realtime Database
-      ↓ ESP32 polls every 3-10 seconds
+      ↓ ESP32 checks small change markers every 3-10 seconds
 ESP32 reads config → drives relay → writes status back
       ↓
 Relay switches the light/device ON/OFF
@@ -483,17 +483,42 @@ which is just a display label and never appears in the path at all.
     config/
       adminSeed    : "1234"              ← used by the PWA/activation page only;
                                             the ESP32 firmware never reads this
-      relayWiring  : "NC" | "NO"         ← read by the ESP32 at boot
+      relayWiring  : "NC" | "NO"         ← ESP32 reads at boot and when configSync/version changes
+      emergencyPin, emergencyTimeout, beeperPin, warnMinutes, beepMs, beepCount
+                                         ← PWA Settings; GPIO numbers apply after a reboot
+      roomsUpdatedAt : <ms or s>         ← "something slot-related changed" marker for
+                                            request.html / activate.html (not read by the ESP32)
+      lastRolloverEpochDay : 20000       ← local calendar-day number of the last daily rollover
+    configSync/
+      version      : 7                   ← PWA bumps atomically (server increment) after a
+                                            Settings save; ESP32 re-reads /config when it changes
+    status/                              ← written by the ESP32 (one PATCH per heartbeat)
+      lastSeenEpoch : 1735700000         ← UTC seconds — what the PWA uses for "controller online"
+      lastSeen      : "2025-01-01 14:32:05" ← board-local (IST) text, kept for older PWAs
+      lights        : "1010"             ← one char per room, room 1 first
+      overrideSeq   : <server timestamp> ← PWA stamps it on every override change; the ESP32 and
+                                            other PWAs read only this tiny value and look at
+                                            per-room overrides when it moves
+    sync/                                ← Sync V2 (daily change log)
+      meta/        generation (YYYYMMDD, IST), revision, updatedAt, …
+      changes/N    {entity, operation, roomId, bucket, recordId, revision, …} or FULL_SYNC
+    slotRecords/roomN/{today|tomorrow}/<slotId>   ← canonical state of a slot that was
+                                            mutated individually (activation etc.). Used for
+                                            incremental deltas only — a full refresh reads
+                                            /rooms/roomN/slots.
+    recurringDefs/roomN/<defId>, roomIndex/roomN  ← Sync V2 side records
+    requests/<id>                        ← booking requests from request.html
     rooms/
       room1/
         name       : "Room 1"
-        override   : null | true | false    ← PWA writes this
-        lightOn    : true | false            ← ESP32 writes this
+        override   : null | true | false    ← PWA writes this (with overrideAt, ms)
+        lightOn    : true | false            ← ESP32 writes this on every state change
         relayPin   : 26 | null               ← PWA writes this; ESP32 reads it at boot
         ledPin     : 2 | null                ← null/absent = no LED for this room
-        slots      : [{s:"09:00", e:"11:00"}, ...]  ← today
-        slotsT     : [{s:"09:00", e:"11:00"}, ...]  ← tomorrow
-        lastSeen   : "14:32:05"              ← ESP32 heartbeat
+        slots      : [{id, s:"09:00", e:"11:00", recurring, code, date, days, activatedAt, …}, ...]  ← today
+        slotsT     : [...]                   ← tomorrow
+        recurring  : [{id, s, e, days, …}]   ← recurring definitions
+        slotsUpdatedAt : <number>            ← legacy per-room change marker
         updatedAt  : 1234567890              ← timestamp
   2/
     name       : "Warehouse"
@@ -507,14 +532,31 @@ in Settings if that happens.
 
 ---
 
-## Polling intervals (unchanged from v2.0)
+## Polling intervals and database usage
 
-| Task | Interval | Purpose |
+ESP32:
+
+| Task | Interval | What it reads/writes |
 |---|---|---|
-| Override poll | 5 seconds | Detect manual override change |
-| Schedule check | 10 seconds | Slot start/end relay control |
-| Slot refresh | 10 seconds | Pick up new slots from PWA |
-| Heartbeat push | 5 minutes | Keep Firebase status current |
+| Override check | 3 seconds | **One** read of `/status/overrideSeq`. Per-room overrides are read only when it changes, every 30 s as a safety net, or on every poll while no `overrideSeq` exists yet (older PWA) |
+| Schedule check | 10 seconds | Local only — no database traffic |
+| Sync V2 check | 10 seconds | `/configSync/version` and `/sync/meta`; `/sync/changes/N` only for new revisions |
+| Heartbeat | 5 minutes | **One** PATCH of `/status` (retried after 30 s if it fails or the clock isn't synced yet) |
+| State change | when a relay changes | `rooms/roomN/lightOn` and `status/lights` |
+
+PWA:
+
+| Task | Interval | What it reads/writes |
+|---|---|---|
+| Live link | continuous | Server-sent events on `/sync/meta` only (tiny). Reconnects with backoff; polls `/sync/meta` every 10 s only while the stream is down |
+| Status poll | 10 seconds, visible tab only | **One** read of `/status` (heartbeat, lights, overrideSeq). Per-room overrides are read only when `overrideSeq` changes, or once a minute as a safety net |
+| Settings save | on demand | One PATCH of `/config` + one atomic `configSync/version` increment |
+
+The "Controller online" bar compares the ESP32's UTC `lastSeenEpoch` with the
+viewing device's clock, so it is correct in any timezone as long as that
+device's date/time is right. It shows "not responding" after 11 minutes
+without a heartbeat. The ESP32 schedules in India time (`GMT_OFFSET_SEC` in
+the sketch) and does its daily rollover at local midnight.
 
 ---
 
@@ -541,7 +583,29 @@ room-controller/
 
 ## Version history
 
-### v4.0 (current)
+### v4.1 (current) — status, sync and database-usage fixes
+- Controller status is timezone-proof (`status/lastSeenEpoch`), is kept on a
+  failed read, and no longer shows a false "online"/"stale" for viewers outside
+  India. The ESP32 heartbeat is one small write with a 30 s retry.
+- Daily rollover now happens at local midnight (it ran at 05:30 IST).
+- A full Sync V2 refresh on the ESP32 reads `/rooms/roomN/slots` (it used to read
+  `/slotRecords`, which could be empty or stale and switch everything off).
+- Room parsing at boot/rollover is bounded per room; expiry writes target the
+  right slot by id.
+- PWA: live-link dot is honest (two failures to go red, stream reconnects with
+  backoff, keep-alive watchdog, resumes on wake/online); profile switches can no
+  longer write one profile's data into another; the profile number is claimed
+  atomically; `activate.html` and `request.html` use the same atomic Sync V2 write.
+- Database usage: override checks, light state and heartbeat each cost one small
+  read per poll (was one or more reads per room); Settings save is one write
+  instead of twelve; profile numbering reads keys only; `activate.html` listens
+  to one marker instead of streaming all of `/rooms`.
+- **Update order:** deploy the PWA first, then flash the new sketch. Either order
+  keeps working (the ESP32 falls back to per-room override reads until the PWA
+  writes `status/overrideSeq`, and the PWA falls back to per-room `lightOn`
+  until the board writes `status/lights`).
+
+### v4.0
 - Multiple profiles (sites) can now share one Firebase database. Each
   profile is automatically assigned an incremental numeric key the first
   time it's saved with a Database URL — all its rooms/config live under

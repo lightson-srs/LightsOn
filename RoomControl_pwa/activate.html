@@ -239,10 +239,14 @@ async function fbPatch(path, value) {
 // This page can run independently of the admin PWA, so the helper is kept
 // self-contained rather than depending on index.html's JS.
 function syncGenerationToday() {
-  const d = new Date();
-  return Number(String(d.getFullYear()) +
-    String(d.getMonth() + 1).padStart(2, '0') +
-    String(d.getDate()).padStart(2, '0'));
+  // The SITE's calendar day in the board's timezone (IST, UTC+5:30) — NOT this
+  // visitor's device date. Must equal syncV2GenerationToday() in index.html: if
+  // writers disagree on the generation, each resets /sync and wipes the other's
+  // change log.
+  const d = new Date(Date.now() + 330 * 60000);
+  return Number(String(d.getUTCFullYear()) +
+    String(d.getUTCMonth() + 1).padStart(2, '0') +
+    String(d.getUTCDate()).padStart(2, '0'));
 }
 function syncBucketName(bucket) { return bucket === 'slotsT' ? 'tomorrow' : 'today'; }
 function syncRoomId(roomKey) {
@@ -252,35 +256,73 @@ function syncRoomId(roomKey) {
 async function appendSlotSyncChange(roomKey, bucket, slotId, operation, slotPatch) {
   try {
     const generation = syncGenerationToday();
-    let meta = await fbGet('/sync/meta');
-    if (!meta || Number(meta.generation) !== generation) {
-      meta = { schemaVersion: 2, generation, revision: 1, resetAt: Date.now(), resetReason: 'activate_page' };
-      const ok = await fbPatch('/', {
-        'sync/meta': meta,
-        'sync/changes': { '1': { type: 'FULL_SYNC', reason: 'activate_page', generation, updatedAt: Date.now() } }
-      });
-      if (!ok) return false;
-    }
-    const revision = Number(meta.revision || 1) + 1;
-    const updatedAt = Date.now();
     const canonicalBucket = syncBucketName(bucket);
     const roomId = syncRoomId(roomKey);
     const recordPath = `slotRecords/${roomKey}/${canonicalBucket}/${slotId}`;
-    const changePath = `sync/changes/${revision}`;
-    const rootPatch = {};
+
+    // 1) Data first, pointer second (same order as index.html): a reader that
+    //    sees the new revision can always find the record it points at.
     if (slotPatch) {
-      Object.keys(slotPatch).forEach(k => { rootPatch[`${recordPath}/${k}`] = slotPatch[k]; });
-      rootPatch[`${recordPath}/id`] = slotId;
-      rootPatch[`${recordPath}/slotTs`] = updatedAt;
-      rootPatch[`${recordPath}/updatedAt`] = updatedAt;
+      const ts = Date.now();
+      const dataPatch = {};
+      Object.keys(slotPatch).forEach(k => { dataPatch[`${recordPath}/${k}`] = slotPatch[k]; });
+      dataPatch[`${recordPath}/id`] = slotId;
+      dataPatch[`${recordPath}/slotTs`] = ts;
+      dataPatch[`${recordPath}/updatedAt`] = ts;
+      if (!await fbPatch('/', dataPatch)) return false;
     }
-    rootPatch[changePath] = {
-      entity: 'slot', operation: operation || 'update', roomId,
-      bucket: canonicalBucket, recordId: slotId, revision, generation, updatedAt
-    };
-    rootPatch['sync/meta/revision'] = revision;
-    rootPatch['sync/meta/updatedAt'] = updatedAt;
-    return await fbPatch('/', rootPatch);
+
+    // 2) Allocate the revision atomically. This used to read /sync/meta and then
+    //    write revision+1 with no condition, so it could overwrite the SAME
+    //    changes/N that the admin PWA committed at the same moment — a lost
+    //    change nobody can detect. Firebase's ETag + If-Match makes the write
+    //    fail with 412 if /sync changed since we read it; we then re-read and
+    //    take the next revision (identical protocol to appendSyncV2ChangeAtomic).
+    const syncUrl = FIREBASE_URL + PROFILE_PREFIX + '/sync.json';
+    const maxAttempts = 8;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const readRes = await fetch(syncUrl + '?nc=' + Date.now() + '_' + attempt, {
+        cache: 'no-store',
+        headers: { 'Accept': 'application/json', 'X-Firebase-ETag': 'true' }
+      });
+      if (!readRes.ok) throw new Error('HTTP ' + readRes.status);
+      const etag = readRes.headers.get('ETag');
+      if (!etag) throw new Error('no ETag for /sync');
+      const sync = (await readRes.json()) || {};
+      const oldMeta = sync.meta || {};
+      const generationChanged = Number(oldMeta.generation) !== generation;
+      const now = Date.now();
+      const revision = generationChanged ? 2 : Number(oldMeta.revision || 1) + 1;
+      const change = {
+        entity: 'slot', operation: operation || 'update', roomId,
+        bucket: canonicalBucket, recordId: slotId, revision, generation, updatedAt: now
+      };
+      const patch = {};
+      if (generationChanged) {
+        patch.meta = { schemaVersion: 2, generation, revision, resetAt: now, resetReason: 'activate_page', updatedAt: now };
+        patch.changes = {
+          '1': { type: 'FULL_SYNC', reason: 'activate_page', generation, updatedAt: now },
+          [String(revision)]: change
+        };
+      } else {
+        patch[`changes/${revision}`] = change;
+        patch['meta/revision'] = revision;
+        patch['meta/updatedAt'] = now;
+      }
+      const writeRes = await fetch(syncUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'If-Match': etag },
+        body: JSON.stringify(patch)
+      });
+      if (writeRes.status === 412) {
+        await new Promise(r => setTimeout(r, 35 + Math.floor(Math.random() * 90)));
+        continue;
+      }
+      if (!writeRes.ok) throw new Error('HTTP ' + writeRes.status);
+      return true;
+    }
+    console.warn('Sync V2 revision not committed after contended attempts');
+    return false;
   } catch(e) {
     console.warn('Sync V2 change write failed', e);
     return false;
@@ -865,7 +907,12 @@ if (FIREBASE_URL && PROFILE_NUM) {
   // this just waits for that burst to go quiet before reading it once.
   (function startSSE() {
     try {
-      const es = new EventSource(FIREBASE_URL + PROFILE_PREFIX + '/rooms.json');
+      // Listen on the tiny /config/roomsUpdatedAt marker, not the whole /rooms
+      // tree: opening a stream on /rooms downloaded every room's full data
+      // (slots, recurring defs, …) on each visit and then streamed every ESP32
+      // status write. loadSlots() only reloads when exactly this marker moves
+      // (every slot writer bumps it), so this fires on the same changes.
+      const es = new EventSource(FIREBASE_URL + PROFILE_PREFIX + '/config/roomsUpdatedAt.json');
       // Do NOT reset loadingSlots — let the guard prevent concurrent loads
       es.addEventListener('put',   scheduleRefresh);
       es.addEventListener('patch', scheduleRefresh);

@@ -175,12 +175,14 @@ async function fbGet(path) {
 }
 async function fbPut(path, value) {
   try {
-    await fetch(FIREBASE_URL + PROFILE_PREFIX + path + '.json', {
+    // res.ok, not just "the request didn't throw": a rejected write (permission
+    // denied, 4xx/5xx) used to be reported as success.
+    const res = await fetch(FIREBASE_URL + PROFILE_PREFIX + path + '.json', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(value)
     });
-    return true;
+    return res.ok;
   } catch(e) { return false; }
 }
 // PATCH — partial update: only the child keys given are touched/replaced,
@@ -190,12 +192,12 @@ async function fbPut(path, value) {
 // key this call never mentioned.
 async function fbPatch(path, value) {
   try {
-    await fetch(FIREBASE_URL + PROFILE_PREFIX + path + '.json', {
+    const res = await fetch(FIREBASE_URL + PROFILE_PREFIX + path + '.json', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(value)
     });
-    return true;
+    return res.ok;
   } catch(e) { return false; }
 }
 
@@ -246,6 +248,70 @@ function normalizeArr(v) {
   if (!v) return [];
   if (Array.isArray(v)) return v;
   return Object.keys(v).sort((a,b)=>parseInt(a)-parseInt(b)).map(k => v[k]);
+}
+
+// First free Firebase child index of a slot bucket. normalizeArr() drops holes
+// (Firebase returns a sparse bucket as an object), so its .length can be
+// smaller than the highest existing key — writing at .length then overwrote a
+// real slot. Use the actual highest key + 1.
+function nextBucketIndex(raw) {
+  if (!raw) return 0;
+  if (Array.isArray(raw)) return raw.length;
+  const keys = Object.keys(raw).map(k => parseInt(k, 10)).filter(n => !isNaN(n));
+  return keys.length ? Math.max.apply(null, keys) + 1 : 0;
+}
+
+// ── Sync V2 publish (self-contained; mirrors index.html / activate.html) ──
+// Auto-approved bookings used to write only the legacy slots + slotsUpdatedAt.
+// The ESP32 ignores that marker once /sync/meta exists, and other admin devices
+// never heard of the booking until a manual Sync. Publishing the canonical record
+// and a change entry makes both pick it up.
+function syncGenerationToday() {
+  // Site day in the board's timezone (IST) — must equal syncV2GenerationToday()
+  // in index.html and syncGenerationToday() in activate.html.
+  const d = new Date(Date.now() + 330 * 60000);
+  return Number(String(d.getUTCFullYear()) + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCDate()).padStart(2, '0'));
+}
+async function publishSlotSync(roomId, bucketName, slot) {
+  try {
+    const generation = syncGenerationToday();
+    const now0 = Date.now();
+    const canonical = { ...slot, version: 1, updatedAt: now0, deleted: false };
+    if (!await fbPut('/slotRecords/room' + roomId + '/' + bucketName + '/' + slot.id, canonical)) return false;
+    const syncUrl = FIREBASE_URL + PROFILE_PREFIX + '/sync.json';
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const readRes = await fetch(syncUrl + '?nc=' + Date.now() + '_' + attempt, {
+        cache: 'no-store', headers: { 'Accept': 'application/json', 'X-Firebase-ETag': 'true' }
+      });
+      if (!readRes.ok) return false;
+      const etag = readRes.headers.get('ETag');
+      if (!etag) return false;
+      const sync = (await readRes.json()) || {};
+      const oldMeta = sync.meta || {};
+      const generationChanged = Number(oldMeta.generation) !== generation;
+      const now = Date.now();
+      const revision = generationChanged ? 2 : Number(oldMeta.revision || 1) + 1;
+      const change = { entity: 'slot', operation: 'create', roomId: Number(roomId), bucket: bucketName,
+        recordId: slot.id, version: 1, revision, generation, updatedAt: now };
+      const patch = {};
+      if (generationChanged) {
+        patch.meta = { schemaVersion: 2, generation, revision, resetAt: now, resetReason: 'request_page', updatedAt: now };
+        patch.changes = { '1': { type: 'FULL_SYNC', reason: 'request_page', generation, updatedAt: now }, [String(revision)]: change };
+      } else {
+        patch['changes/' + revision] = change;
+        patch['meta/revision'] = revision;
+        patch['meta/updatedAt'] = now;
+      }
+      const w = await fetch(syncUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'If-Match': etag },
+        body: JSON.stringify(patch)
+      });
+      if (w.status === 412) { await new Promise(r => setTimeout(r, 35 + Math.floor(Math.random() * 90))); continue; }
+      return w.ok;
+    }
+    return false;
+  } catch(e) { return false; }
 }
 
 // ── Load rooms + compute AVAILABLE (free) 1-hour blocks for today/tomorrow ──
@@ -432,7 +498,9 @@ async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
 // in that case, not left dangling as "open").
 async function tryAutoApprove(id, room, opt, reqObj) {
   const bucketPath = '/rooms/room' + room.id + (opt.dayIdx === 0 ? '/slots' : '/slotsT');
-  const arr = normalizeArr(await fbGet(bucketPath));
+  const rawBucket = await fbGet(bucketPath);
+  const arr = normalizeArr(rawBucket);
+  const newIdx = nextBucketIndex(rawBucket);
   const collision = arr.some(sl => sl && !sl.deleted && sl.s === opt.s && sl.e === opt.e);
   if (collision) {
     await fbPut('/requests/' + id, { ...reqObj, status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' });
@@ -460,9 +528,12 @@ async function tryAutoApprove(id, room, opt, reqObj) {
   // marker the ESP32's refreshSlotsOnly() checks. Tomorrow's bucket doesn't
   // need that one; the ESP32 doesn't poll /slotsT routinely.
   const ok = opt.dayIdx === 0
-    ? await fbPatch('/rooms/room' + room.id, { [`slots/${arr.length}`]: newSlot, slotsUpdatedAt: Date.now() })
-    : await fbPut(bucketPath + '/' + arr.length, newSlot);
+    ? await fbPatch('/rooms/room' + room.id, { [`slots/${newIdx}`]: newSlot, slotsUpdatedAt: Date.now() })
+    : await fbPut(bucketPath + '/' + newIdx, newSlot);
   if (!ok) return false;
+  // Let the ESP32 and other admin devices see it (best effort: the booking is
+  // already saved; a failed publish still gets picked up by their next full refresh).
+  await publishSlotSync(room.id, opt.dayIdx === 0 ? 'today' : 'tomorrow', newSlot);
 
   // A confirmed auto-approval is a real schedule mutation. Publish the
   // ID-keyed canonical slot and CREATE delta before confirming the request.

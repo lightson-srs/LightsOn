@@ -248,6 +248,18 @@
     .toast { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 8px 18px; font-size: 13px; opacity: 0; transition: opacity 0.3s; pointer-events: none; white-space: nowrap; z-index: 400; }
     .toast.show { opacity: 1; }
 
+    /* Toast with an action button — for messages the user can resolve (e.g. a
+       timestamp/version mismatch → "Reload"). Unlike .toast it is tappable and
+       stays until dismissed or ~20 s. */
+    .action-toast { position: fixed; bottom: 140px; left: 50%; transform: translateX(-50%) translateY(12px); width: calc(100% - 32px); max-width: 420px; background: var(--card2); border: 1px solid var(--amber); border-radius: 12px; padding: 10px 12px; font-size: 13px; display: flex; align-items: center; gap: 10px; opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s; z-index: 410; }
+    .action-toast.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0); }
+    .action-toast .at-msg { flex: 1; line-height: 1.35; }
+    .action-toast .at-btn { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 8px 14px; min-height: 36px; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .action-toast .at-btn:disabled { opacity: 0.6; cursor: default; }
+    .action-toast .at-close { background: none; border: none; color: var(--muted); font-size: 18px; line-height: 1; padding: 6px; min-width: 32px; min-height: 32px; cursor: pointer; }
+    .ctrl-status .ctrl-reload { margin-left: 10px; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: 6px; padding: 2px 10px; min-height: 26px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .ctrl-status .ctrl-reload:disabled { opacity: 0.6; cursor: default; }
+
     .toggle { position: relative; width: 40px; height: 22px; }
     .toggle input { opacity: 0; width: 0; height: 0; }
     .tslider { position: absolute; inset: 0; background: #333355; border-radius: 22px; cursor: pointer; transition: background 0.2s; }
@@ -722,6 +734,12 @@
 
 <div class="toast" id="toast">
 
+</div>
+
+<div class="action-toast" id="actionToast" role="alert" aria-live="assertive">
+  <span class="at-msg" id="actionToastMsg"></span>
+  <button type="button" class="at-btn" id="actionToastBtn">Reload</button>
+  <button type="button" class="at-close" id="actionToastClose" aria-label="Dismiss">×</button>
 </div>
 
 <script src="product-info.js"></script>
@@ -2483,7 +2501,7 @@ function printRequestQR() {
   const baseUrl = window.location.href.replace('index.html','').replace(/\/$/, '');
   const requestUrl = baseUrl + '/request.html?db=' + encodeURIComponent(p.dbUrl) + '&p=' + p.fbNum;
   const win = window.open('', '_blank');
-  const scriptTag = '<scr' + 'ipt src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></' + 'script>';
+  const scriptTag = '<scr' + 'ipt src="' + baseUrl + '/js/qrcode.min.js"></' + 'script>';
   const inlineScript = '<scr' + 'ipt>window.onload=function(){new QRCode(document.getElementById("qr"),{text:"' + requestUrl + '",width:280,height:280,colorDark:"#000000",colorLight:"#ffffff",correctLevel:2});setTimeout(function(){window.print();},800);};</' + 'script>';
   const productFooterHtml =
     '<div style="margin-top:24px;font-size:12px;color:#999;line-height:1.6">' +
@@ -2756,7 +2774,7 @@ function printQR() {
   const activateUrl = baseUrl + '/activate.html?db=' + encodeURIComponent(p.dbUrl) + '&p=' + p.fbNum;
   const win = window.open('', '_blank');
   // Use string concat to avoid script-closing tag inside string breaking parser
-  const scriptTag = '<scr' + 'ipt src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></' + 'script>';
+  const scriptTag = '<scr' + 'ipt src="' + baseUrl + '/js/qrcode.min.js"></' + 'script>';
   const inlineScript = '<scr' + 'ipt>window.onload=function(){new QRCode(document.getElementById("qr"),{text:"' + activateUrl + '",width:280,height:280,colorDark:"#000000",colorLight:"#ffffff",correctLevel:2});setTimeout(function(){window.print();},800);};</' + 'script>';
   const productFooterHtml =
     '<div style="margin-top:24px;font-size:12px;color:#999;line-height:1.6">' +
@@ -2821,8 +2839,9 @@ function productInfoModalBackdropClick(e) {
 // than that so content never crowds the page margins.
 function printProductInfo() {
   const url = pwaRootUrl();
+  const qrLibUrl = url.replace(/[^/]*$/, 'js/qrcode.min.js');
   const win = window.open('', '_blank');
-  const scriptTag = '<scr' + 'ipt src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></' + 'script>';
+  const scriptTag = '<scr' + 'ipt src="' + qrLibUrl + '"></' + 'script>';
   const inlineScript = '<scr' + 'ipt>window.onload=function(){new QRCode(document.getElementById("qr"),{text:"' + url + '",width:120,height:120,colorDark:"#000000",colorLight:"#ffffff",correctLevel:2});setTimeout(function(){window.print();},500);};</' + 'script>';
   win.document.write(
     '<!DOCTYPE html><html><head><title>' + PRODUCT_INFO.name + '</title>' +
@@ -2860,7 +2879,10 @@ function persist() {
     if (currentSavedAt > lastKnownSavedAt) {
       lastKnownSavedAt = currentSavedAt;
       addLog('error', 'Newer data found from another tab — reload this tab to avoid losing changes');
-      showToast('⚠️ Newer data from another tab — please reload');
+      // Another tab saved newer data (its savedAt is ahead of ours). This tab's
+      // memory is stale, so reloading the page re-reads the newer copy and then
+      // re-syncs with Firebase.
+      showActionToast('⚠️ Newer data was saved from another tab', 'Reload', () => window.location.reload());
       return;
     }
   } catch(e) {}
@@ -2965,18 +2987,51 @@ function getActiveProfile() {
 async function ensureProfileNumber(p) {
   if (p.fbNum) return p.fbNum;
   if (!p.dbUrl) return null;
-  const existing = await fbGet('/profiles', p); // p.fbNum unset here → no prefix → correct bare path
+  // Keys only (?shallow=true → {"1":true,"2":true}). The old read downloaded the
+  // ENTIRE /profiles tree — every profile's rooms, slots and logs — just to find
+  // the highest number.
+  let keys;
+  try {
+    const res = await fetch(`${p.dbUrl}/profiles.json?shallow=true&nc=${Date.now()}`,
+      { cache: 'no-store', headers: { 'Accept': 'application/json' } });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    keys = await res.json();
+  } catch (e) {
+    // A failed read used to look like "no profiles yet" and claimed number 1,
+    // colliding with a real profile 1. Don't assign anything we can't verify.
+    addLog('error', 'Could not read /profiles: ' + e.message);
+    showToast('⚠️ Could not reach Firebase to assign this profile a number — try again');
+    return null;
+  }
   let maxNum = 0;
-  if (existing && typeof existing === 'object') {
-    Object.keys(existing).forEach(k => {
+  if (keys && typeof keys === 'object') {
+    Object.keys(keys).forEach(k => {
       const n = parseInt(k, 10);
       if (!isNaN(n) && n > maxNum) maxNum = n;
     });
   }
-  const assigned = maxNum + 1;
-  await fbSet(`/profiles/${assigned}/name`, p.name, p); // still unprefixed — fbNum not set until after this
-  p.fbNum = assigned;
-  return assigned;
+  // Claim the number atomically: `if-match: null_etag` makes the write succeed
+  // only if /profiles/{n}/name is still empty. Two devices picking the same
+  // "next" number used to silently share one namespace; now the loser gets 412
+  // and takes the following number.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const assigned = maxNum + 1 + attempt;
+    try {
+      const res = await fetch(`${p.dbUrl}/profiles/${assigned}/name.json`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'if-match': 'null_etag' },
+        body: JSON.stringify(p.name)
+      });
+      if (res.ok) { p.fbNum = assigned; return assigned; }
+      if (res.status !== 412) throw new Error('HTTP ' + res.status);
+    } catch (e) {
+      addLog('error', 'Could not claim profile number: ' + e.message);
+      showToast('⚠️ Could not assign this profile a number — try again');
+      return null;
+    }
+  }
+  showToast('⚠️ Could not find a free profile number — try again');
+  return null;
 }
 
 // Pushes a profile's display name to its own /profiles/{n}/name — built from
@@ -3047,7 +3102,29 @@ function profilePathPrefix(p) {
 // database than the earlier calls did, corrupting both.
 function fbUrl(path, profile) {
   const p = profile || getActiveProfile();
-  return `${p.dbUrl}${profilePathPrefix(p)}${path}.json`;
+  // path '/' means "the profile root" (used for multi-path PATCHes). Build it as
+  // /profiles/N.json — or /.json at the database root — rather than relying on
+  // Firebase accepting an empty segment in /profiles/N/.json.
+  let rel = profilePathPrefix(p) + (path === '/' ? '' : path);
+  if (!rel) rel = '/';
+  return `${p.dbUrl}${rel}.json`;
+}
+
+// ── Connection health ────────────────────────────────────────
+// The header dot used to flip red on ANY single failed request (including a
+// background poll) and only turned green on an SSE event or a write, so it could
+// sit red on a healthy link or stay green on a dead one. Now every REST call
+// reports here: success turns it green at once; it only goes red after two
+// failures in a row, so one dropped request doesn't flash "Offline".
+let netFailStreak = 0;
+function noteNet(ok) {
+  if (ok) {
+    netFailStreak = 0;
+    if (!fbConnected) setConnStatus(true);
+  } else {
+    netFailStreak++;
+    if (netFailStreak >= 2) setConnStatus(false);
+  }
 }
 
 async function fbSet(path, value, profile) {
@@ -3060,10 +3137,11 @@ async function fbSet(path, value, profile) {
       body: JSON.stringify(value)
     });
     if (!res.ok) throw new Error(await res.text());
+    noteNet(true);
     return true;
   } catch(e) {
     addLog('error', e.message);
-    setConnStatus(false);
+    noteNet(false);
     return false;
   }
 }
@@ -3080,10 +3158,11 @@ async function fbPatch(path, value, profile) {
       body: JSON.stringify(value)
     });
     if (!res.ok) throw new Error(await res.text());
+    noteNet(true);
     return true;
   } catch(e) {
     addLog('error', e.message);
-    setConnStatus(false);
+    noteNet(false);
     return false;
   }
 }
@@ -3100,11 +3179,42 @@ async function fbGet(path, profile) {
     // next, like ensureProfileNumber(). Matches activate.html's same fix.
     const res = await fetch(fbUrl(path, profile) + '?nc=' + Date.now(), { cache: 'no-store', headers: { 'Accept': 'application/json' } });
     if (!res.ok) throw new Error(await res.text());
-    return await res.json();
+    const json = await res.json();
+    noteNet(true);
+    return json;
   } catch(e) {
     addLog('error', e.message);
-    setConnStatus(false);
+    noteNet(false);
     return null;
+  }
+}
+
+// Firebase's own clock minus this device's clock (ms), learned opportunistically
+// from the HTTP Date header of a response. Stays 0 when the header isn't exposed
+// to the page, in which case nothing changes. Costs no extra requests.
+let serverClockOffsetMs = 0;
+function noteServerClock(res) {
+  try {
+    const h = res.headers.get('Date');
+    const t = h ? Date.parse(h) : NaN;
+    if (!isNaN(t)) serverClockOffsetMs = t - Date.now();
+  } catch(e) {}
+}
+
+// Same as fbGet but tells "request failed" (returns undefined) apart from
+// "node is empty" (returns null) — fbGet collapses both into null, which made a
+// network blip look like "no heartbeat yet" / "no data". Use where that matters.
+async function fbGetOrUndef(path, profile) {
+  try {
+    const res = await fetch(fbUrl(path, profile) + '?nc=' + Date.now(), { cache: 'no-store', headers: { 'Accept': 'application/json' } });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    noteServerClock(res);
+    const json = await res.json();
+    noteNet(true);
+    return json;
+  } catch(e) {
+    noteNet(false);
+    return undefined;
   }
 }
 
@@ -3126,6 +3236,15 @@ function applyRemoteRoomSnapshot(roomId, remote) {
     state.rooms.push(room);
     state.rooms.sort((a,b) => a.id-b.id);
   }
+  // Unsaved local edits win until pushRoom() has written them (it resolves any
+  // real conflict itself, by slotTs). Replacing the room here used to throw the
+  // user's just-made change away — including when the snapshot was the echo of
+  // this very device's own write.
+  if (room._dirty) {
+    if (remote.lightOn !== undefined) room.lightOn = remote.lightOn;
+    reconcileOverride(room, remote);
+    return true;
+  }
   if (typeof remote.name === 'string' && remote.name.trim()) room.name = remote.name;
   if (remote.relayPin === null || typeof remote.relayPin === 'number') room.relayPin = remote.relayPin;
   if (remote.ledPin === null || typeof remote.ledPin === 'number') room.ledPin = remote.ledPin;
@@ -3142,6 +3261,10 @@ function applyRemoteRoomSnapshot(roomId, remote) {
 
 async function pwaFullRoomsRefresh(p, meta, reason) {
   const data = await fbGet('/rooms', p);
+  // The user may have switched profile while this (large) read was in flight;
+  // state.rooms now belongs to the OTHER profile, so applying this data would
+  // overwrite it and delete its rooms.
+  if (!isActiveProfile(p)) return false;
   if (!data || typeof data !== 'object') return false;
   const seen = new Set();
   Object.keys(data).forEach(key => {
@@ -3152,7 +3275,8 @@ async function pwaFullRoomsRefresh(p, meta, reason) {
   });
   // Remove only rooms that were previously synced but no longer exist remotely.
   // A completely empty database does not reach this branch because data must be an object.
-  state.rooms = state.rooms.filter(r => seen.has(r.id));
+  // (A room with unsaved local changes — e.g. just added — isn't remote yet.)
+  state.rooms = state.rooms.filter(r => seen.has(r.id) || r._dirty);
   if (!state.rooms.length) state.rooms = makeBlankRooms();
   if (meta) {
     p.pwaSyncGeneration = Number(meta.generation || 0);
@@ -3170,21 +3294,35 @@ async function applyPwaSyncV2Change(revision, change, p) {
   if (change.type === 'FULL_SYNC') return 'full';
   const roomId = Number(change.roomId);
   if (!roomId || !change.entity) return false;
+  // Returns true (applied), 'full' (needs a full refresh), false (bad/missing
+  // data → full refresh) or 'abort' (user switched profile mid-flight: state.rooms
+  // is no longer this profile's, so touch nothing and let the caller stop).
+  if (!isActiveProfile(p)) return 'abort';
   const room = state.rooms.find(r => r.id === roomId);
+  // Unsaved local edits on this room: skip the remote delta. pushRoom() will
+  // detect the slotTs mismatch and adopt the remote version itself.
+  if (room && room._dirty && (change.entity === 'slot' || change.entity === 'recurringDef')) return true;
 
   if (change.entity === 'slot') {
     if (!room || !change.recordId) return false;
     const bucket = change.bucket === 'tomorrow' ? 1 : 0;
     const canonical = await fbGet(`/slotRecords/room${roomId}/${change.bucket === 'tomorrow' ? 'tomorrow' : 'today'}/${change.recordId}`, p);
+    if (!isActiveProfile(p)) return 'abort';
     if (!canonical || typeof canonical !== 'object') return false;
     room.slots = room.slots || {0:[],1:[]};
     const list = normalizeSlots(room.slots[bucket]);
     const idx = list.findIndex(sl => sl && sl.id === change.recordId);
+    // A canonical record can be PARTIAL — activate.html writes only the
+    // activation fields when no full record exists yet. Merge it over the slot
+    // we hold instead of replacing (which erased start/end). A partial record
+    // for a slot we don't have can't be built into a slot → full refresh.
+    const hasTimes = typeof canonical.s === 'string' && typeof canonical.e === 'string';
     if (canonical.deleted || change.operation === 'delete') {
-      if (idx >= 0) list[idx] = { ...canonical, deleted:true };
-      else list.push({ ...canonical, deleted:true });
-    } else if (idx >= 0) list[idx] = canonical;
-    else list.push(canonical);
+      if (idx >= 0) list[idx] = { ...list[idx], ...canonical, deleted:true };
+      else if (hasTimes) list.push({ ...canonical, deleted:true });
+    } else if (idx >= 0) list[idx] = { ...list[idx], ...canonical };
+    else if (hasTimes) list.push(canonical);
+    else return false;
     room.slots[bucket] = ensureSlotIds(list);
     room._syncedSlotIds = room.slots[0].map(sl => sl && sl.id).filter(Boolean);
     return true;
@@ -3193,6 +3331,7 @@ async function applyPwaSyncV2Change(revision, change, p) {
   if (change.entity === 'recurringDef') {
     if (!room || !change.recordId) return false;
     const canonical = await fbGet(`/recurringDefs/room${roomId}/${change.recordId}`, p);
+    if (!isActiveProfile(p)) return 'abort';
     if (!canonical || typeof canonical !== 'object') return false;
     const defs = Array.isArray(room.recurringDefs) ? room.recurringDefs : [];
     const idx = defs.findIndex(d => d && d.id === change.recordId);
@@ -3207,15 +3346,44 @@ async function applyPwaSyncV2Change(revision, change, p) {
 
   if (change.entity === 'roomSnapshot') {
     const remote = await fbGet(`/rooms/room${roomId}`, p);
+    if (!isActiveProfile(p)) return 'abort';
     return applyRemoteRoomSnapshot(roomId, remote);
   }
   return false;
 }
 
+// True while switchProfile() is between tearing down the old connection and
+// having the new profile's number/listener ready. Background timers skip work
+// in that window — getActiveProfile() already returns the new profile but its
+// fbNum may not be allocated yet, which would send reads to the un-prefixed
+// database root.
+let profileSwitchInFlight = false;
+function isActiveProfile(p) {
+  const a = getActiveProfile();
+  return !!a && !!p && a.id === p.id;
+}
+
+// A meta that arrives while a sync is running used to be DROPPED (and the running
+// loop only goes up to the revision it saw at its start), so the PWA could sit
+// behind indefinitely in SSE mode. Keep the newest one and run it afterwards.
+let pwaSyncPending = null;
 async function pwaSyncFromMeta(meta, p) {
-  if (pwaSyncInFlight || !meta || typeof meta !== 'object') return;
+  if (!meta || typeof meta !== 'object' || !p) return;
+  if (!isActiveProfile(p)) return; // late event from a profile we already left
+  if (pwaSyncInFlight) { pwaSyncPending = { meta, p }; return; }
   pwaSyncInFlight = true;
   try {
+    await pwaSyncCore(meta, p);
+  } finally {
+    pwaSyncInFlight = false;
+    const next = pwaSyncPending;
+    pwaSyncPending = null;
+    if (next && isActiveProfile(next.p)) pwaSyncFromMeta(next.meta, next.p);
+  }
+}
+
+async function pwaSyncCore(meta, p) {
+  {
     const remoteGeneration = Number(meta.generation || 0);
     const remoteRevision = Number(meta.revision || 0);
     const localGeneration = Number(p.pwaSyncGeneration || 0);
@@ -3228,17 +3396,19 @@ async function pwaSyncFromMeta(meta, p) {
       return;
     }
     if (localRevision === remoteRevision) {
-      setConnStatus(true);
+      noteNet(true);
       return;
     }
 
     for (let revision = localRevision + 1; revision <= remoteRevision; revision++) {
       const change = await fbGet(`/sync/changes/${revision}`, p);
+      if (!isActiveProfile(p)) return;
       if (!change) {
         await pwaFullRoomsRefresh(p, meta, `missing revision ${revision}`);
         return;
       }
       const applied = await applyPwaSyncV2Change(revision, change, p);
+      if (applied === 'abort') return;
       if (applied === 'full' || applied !== true) {
         await pwaFullRoomsRefresh(p, meta,
           applied === 'full' ? `FULL_SYNC revision ${revision}` : `invalid revision ${revision}`);
@@ -3250,17 +3420,18 @@ async function pwaSyncFromMeta(meta, p) {
     persist();
     renderDashboard();
     refreshTimelineIfVisible();
-    setConnStatus(true);
+    noteNet(true);
     addLog('ok', `Sync V2 incremental → revision ${remoteRevision}`);
-  } finally {
-    pwaSyncInFlight = false;
   }
 }
 
-async function startPwaSyncV2() {
-  const p = getActiveProfile();
+async function startPwaSyncV2(pArg) {
+  // Takes the profile explicitly so a caller that already pinned one isn't
+  // re-resolved against whatever is active by the time this runs.
+  const p = pArg || getActiveProfile();
   if (!p || !p.dbUrl) return;
   const meta = await fbGet('/sync/meta', p);
+  if (!isActiveProfile(p)) return;
   if (!meta || typeof meta !== 'object') {
     // Pre-Sync-V2 or incomplete database: one compatibility bootstrap.
     await pwaFullRoomsRefresh(p, null, 'Sync V2 metadata unavailable');
@@ -3272,63 +3443,212 @@ async function startPwaSyncV2() {
 // Lightweight live listener: /sync/meta is tiny and does not stream /rooms.
 // Slot bodies are fetched only for revisions that changed.
 // ── Firebase SSE listener (real-time) ───────────────────────
+let sseRetryTimer = null;
+let sseRetryDelay = 2000;   // backoff: 2 s → 60 s, reset when a stream opens
+let sseLastEvent = 0;       // last time ANY event (incl. keep-alive) arrived
+
+function stopFbListener() {
+  if (fbListener) { try { fbListener.close(); } catch(e) {} fbListener = null; }
+  if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
+}
+
+// After a stream error the listener used to be closed for good and the PWA fell
+// back to polling forever. Retry the stream with backoff instead; polling only
+// covers the gap.
+function scheduleSseRetry(p) {
+  if (sseRetryTimer) return;
+  const delay = sseRetryDelay;
+  sseRetryDelay = Math.min(sseRetryDelay * 2, 60000);
+  sseRetryTimer = setTimeout(() => {
+    sseRetryTimer = null;
+    if (!isActiveProfile(p) || profileSwitchInFlight) return;
+    startFbListener();
+  }, delay);
+}
+
 function startFbListener() {
   const p = getActiveProfile();
-  if (!p.dbUrl) return;
-  if (fbListener) { fbListener.close(); fbListener = null; }
+  if (!p || !p.dbUrl) return;
+  stopFbListener();
   const url = `${p.dbUrl}${profilePathPrefix(p)}/sync/meta.json`;
   let es;
   try { es = new EventSource(url); }
-  catch(e) { startPolling(); return; }
+  catch(e) { startPolling(); scheduleSseRetry(p); return; }
   fbListener = es;
+  sseLastEvent = Date.now();
+  // Running copy of /sync/meta assembled from the stream. appendSyncV2ChangeAtomic
+  // commits with a multi-path PATCH, which the stream can deliver as a PARTIAL
+  // {revision, updatedAt} object with no generation — that used to be read as a
+  // complete meta (generation 0) and forced a full /rooms download on every change.
+  let meta = null;
+
+  const fail = () => {
+    if (fbListener !== es) return;
+    noteNet(false);
+    stopFbListener();
+    startPolling();
+    scheduleSseRetry(p);
+  };
+
+  es.onopen = () => {
+    if (fbListener !== es) return;
+    sseLastEvent = Date.now();
+    sseRetryDelay = 2000;
+    stopPolling();   // the stream is back; polling was only the fallback
+    noteNet(true);
+  };
+
   const onMetaEvent = e => {
+    if (fbListener !== es) return;
+    sseLastEvent = Date.now();
     try {
       const d = JSON.parse(e.data);
-      // Listener root is /sync/meta; a root put carries the complete meta object.
-      // A field patch is cheapest to resolve by one small /sync/meta GET.
-      if (d.path === '/' && d.data && typeof d.data === 'object') {
-        pwaSyncFromMeta(d.data, p);
+      if (!d) return;
+      const path = d.path;
+      if (path === '/') {
+        if (e.type === 'patch') {
+          meta = Object.assign(meta || {}, (d.data && typeof d.data === 'object') ? d.data : {});
+        } else {
+          meta = (d.data && typeof d.data === 'object') ? Object.assign({}, d.data) : null;
+        }
+      } else if (e.type === 'put' && typeof path === 'string' && /^\/[^/]+$/.test(path)) {
+        meta = meta || {};
+        if (d.data === null) delete meta[path.slice(1)]; else meta[path.slice(1)] = d.data;
       } else {
-        fbGet('/sync/meta', p).then(meta => pwaSyncFromMeta(meta, p));
+        meta = null; // unexpected shape — resolve with one GET below
       }
-      setConnStatus(true);
-    } catch(err) { setConnStatus(false); }
+      if (meta && meta.generation != null && meta.revision != null) {
+        pwaSyncFromMeta(Object.assign({}, meta), p);   // complete: no extra read
+      } else if (!(path === '/' && e.type === 'put' && d.data === null)) {
+        fbGet('/sync/meta', p).then(m => {
+          if (fbListener === es && m && typeof m === 'object') meta = Object.assign({}, m);
+          return pwaSyncFromMeta(m, p);
+        });
+      }
+      noteNet(true);
+    } catch(err) { noteNet(false); }
   };
   es.addEventListener('put', onMetaEvent);
   es.addEventListener('patch', onMetaEvent);
-  es.onerror = () => {
-    setConnStatus(false);
-    if (fbListener) { fbListener.close(); fbListener = null; }
-    startPolling();
-  };
-  startControlPolling();
+  // Firebase sends a keep-alive roughly every 30 s. Not acting on it meant a
+  // stalled stream never looked different from a quiet one.
+  es.addEventListener('keep-alive', () => { if (fbListener === es) sseLastEvent = Date.now(); });
+  es.addEventListener('cancel', fail);        // security rules rejected the listener
+  es.addEventListener('auth_revoked', fail);
+  es.onerror = fail;
+  if (!pwaControlPoll) startControlPolling();
 }
+
+// 90 s with no event (not even a keep-alive) = the stream is dead but the
+// browser hasn't noticed. Re-open it.
+function sseWatchdog() {
+  if (document.hidden || profileSwitchInFlight) return;
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl || !fbListener) return;
+  if (Date.now() - sseLastEvent > 90000) { noteNet(false); startFbListener(); }
+}
+setInterval(sseWatchdog, 30000);
+
+// Phones freeze timers/streams in the background and tabs come back after sleep
+// or a network change with the dot and data stale. Re-establish the live link.
+function resumeConnection() {
+  if (profileSwitchInFlight) return;
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl) return;
+  // A fresh stream's first event carries the current meta, so reconnecting IS
+  // the catch-up sync — no separate /sync/meta read needed.
+  if (!fbListener || Date.now() - sseLastEvent > 60000) startFbListener();
+  pollRoomControlsOnce(true);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeConnection(); });
+window.addEventListener('online', resumeConnection);
+window.addEventListener('offline', () => setConnStatus(false));
 
 // Overrides and ESP light state are not slot Sync V2 entities. Poll only those
 // scalar fields; never download /rooms or slot arrays in this routine.
-async function pollRoomControlsOnce() {
+//
+// Cost per poll (was 2–3 GETs PER ROOM, serial, every 10 s, even in a hidden tab):
+//   • ONE GET of /status — the board heartbeat (lastSeenEpoch), every room's
+//     light state ("lights": "1010") and overrideSeq, all in one tiny node.
+//   • Per-room override reads only when overrideSeq changed (or once a minute as
+//     a safety net, or every poll while no overrideSeq exists yet = older
+//     firmware/PWA), instead of every poll.
+// Skipped entirely while the tab is hidden; resumeConnection() refreshes on return.
+let controlPollInFlight = false;
+let lastOverrideSeqSeen = null;   // reset per profile in resetConnectionForProfileChange()
+let lastOverrideFullCheck = 0;
+async function pollRoomControlsOnce(force) {
   const p = getActiveProfile();
-  if (!p || !p.dbUrl) return;
-  for (const room of state.rooms) {
-    const remoteAt = await fbGet(`/rooms/room${room.id}/overrideAt`, p);
-    if (typeof remoteAt === 'number' && remoteAt !== Number(room.overrideAt || 0)) {
-      const remoteOverride = await fbGet(`/rooms/room${room.id}/override`, p);
-      reconcileOverride(room, { override:remoteOverride, overrideAt:remoteAt });
+  if (!p || !p.dbUrl || profileSwitchInFlight) return;
+  if (document.hidden && force !== true) return;
+  if (controlPollInFlight) return;
+  controlPollInFlight = true;
+  try {
+    const st = await fbGetOrUndef('/status', p);
+    if (!isActiveProfile(p)) return;      // switched profile mid-request
+    if (st === undefined) return;         // request failed — keep what we show
+    applyControllerStatus(st);
+    let changed = false;
+
+    if (st && typeof st.lights === 'string') {
+      state.rooms.forEach(room => {
+        const c = st.lights.charAt(room.id - 1);
+        if (c === '1' || c === '0') {
+          const on = (c === '1');
+          if (room.lightOn !== on) { room.lightOn = on; changed = true; }
+        }
+      });
+    } else {
+      // Older firmware without /status/lights: per-room lightOn reads, as before.
+      for (const room of state.rooms) {
+        const on = await fbGet(`/rooms/room${room.id}/lightOn`, p);
+        if (!isActiveProfile(p)) return;
+        if ((on === true || on === false) && room.lightOn !== on) { room.lightOn = on; changed = true; }
+      }
     }
-    const lightOn = await fbGet(`/rooms/room${room.id}/lightOn`, p);
-    if (lightOn === true || lightOn === false) room.lightOn = lightOn;
+
+    const seq = st ? st.overrideSeq : undefined;
+    const now = Date.now();
+    if (seq === undefined || seq !== lastOverrideSeqSeen || now - lastOverrideFullCheck > 60000) {
+      let complete = true;
+      for (const room of state.rooms) {
+        const remoteAt = await fbGetOrUndef(`/rooms/room${room.id}/overrideAt`, p);
+        if (!isActiveProfile(p)) return;
+        if (remoteAt === undefined) { complete = false; continue; }
+        if (typeof remoteAt === 'number' && remoteAt !== Number(room.overrideAt || 0)) {
+          const remoteOverride = await fbGetOrUndef(`/rooms/room${room.id}/override`, p);
+          if (!isActiveProfile(p)) return;
+          if (remoteOverride === undefined) { complete = false; continue; }
+          const before = room.override, beforeAt = room.overrideAt;
+          reconcileOverride(room, { override:remoteOverride, overrideAt:remoteAt });
+          if (room.override !== before || room.overrideAt !== beforeAt) changed = true;
+        }
+      }
+      lastOverrideFullCheck = now;
+      // Only trust the marker after a complete pass, else re-scan next poll.
+      if (complete && seq !== undefined) lastOverrideSeqSeen = seq;
+    }
+
+    if (changed) { persist(); renderDashboard(); }
+  } finally {
+    controlPollInFlight = false;
   }
-  persist();
-  renderDashboard();
 }
 function startControlPolling() {
   if (pwaControlPoll) clearInterval(pwaControlPoll);
-  pollRoomControlsOnce();
+  pollRoomControlsOnce(true);
   pwaControlPoll = setInterval(pollRoomControlsOnce, 10000);
 }
 
 // Track when PWA last wrote override to prevent immediate sync overwrite
+// Keyed by profile AND room: it used to be keyed by room number alone, so after
+// a profile switch the new profile's same-numbered room looked "just set here"
+// and ignored its real remote override for up to 30 s.
 const overrideWriteTime = {};
+function owKey(roomId, profile) {
+  const p = profile || getActiveProfile();
+  return (p ? p.id : '') + ':' + roomId;
+}
 
 // Firebase's SSE stream reports `path` relative to the listener's own root
 // (this listener is on /rooms.json) — e.g. "/" for the initial snapshot,
@@ -3608,28 +3928,12 @@ async function manualSyncFromFirebase(opts) {
     // on success. Pinned profile so every write targets the same database
     // even across a mid-sync profile switch.
     let pushOk = true;
-    // On a MANUAL sync, reconcile the override BEFORE the dirty-push loop.
-    // Otherwise a room stuck _dirty on this device (e.g. a Force ON set here
-    // earlier, or a failed push) would push its stale override back up in step
-    // 1 and clobber a newer value another device wrote (e.g. device A set all
-    // rooms to Auto) — the reported "device B keeps re-winning with Manual ON"
-    // bug. We peek at Firebase's current override for each room and, unless THIS
-    // device set an override in the last 30s, adopt the remote value and clear
-    // the local override-write timestamp. This makes Firebase authoritative for
-    // the override on an explicit Sync, so step 1 won't re-push a stale one.
-    if (!silent) {
-      try {
-        const pre = await fbGet('/rooms', p);
-        if (pre && typeof pre === 'object') {
-          Object.keys(pre).forEach(key => {
-            const idx = parseInt(key.replace('room', ''), 10) - 1;
-            if (idx < 0 || idx >= state.rooms.length) return;
-            reconcileOverride(state.rooms[idx], pre[key] || {});
-          });
-        }
-      } catch (e) { /* non-fatal — the post-push pull below still reconciles */ }
-    }
-
+    // (There used to be a full /rooms download here, solely to adopt remote
+    // overrides BEFORE this push so a stuck-dirty room couldn't re-push a stale
+    // override over a newer one. pushRoom() no longer writes override/overrideAt
+    // at all — overrides have their own writer, writeOverrideOnly() — so that
+    // protection is moot, and step 2 below reconciles overrides from the pull
+    // anyway. Dropping it halves this function's download.)
     try {
       for (let i = 0; i < state.rooms.length; i++) {
         if (state.rooms[i]._dirty) {
@@ -3643,7 +3947,13 @@ async function manualSyncFromFirebase(opts) {
     }
 
     // ── 2. PULL authoritative copy back and replace local ──
+    // Read the Sync V2 head BEFORE the data: the pull below is at least as new as
+    // this revision, so recording it as the cursor can only cause an idempotent
+    // re-apply of a change, never skip one. Without it the cursor stayed at its
+    // old value and the next live event replayed every change since.
+    const metaBeforePull = silent ? null : await fbGet('/sync/meta', p);
     const data = await fbGet('/rooms', p);
+    if (!isActiveProfile(p)) return; // switched profile mid-pull: state.rooms is no longer this profile's
     if (!data || typeof data !== 'object') {
       if (!silent) showToast('⚠️ Could not read from Firebase — check connection');
       addLog('error', 'Sync: no data from Firebase');
@@ -3707,6 +4017,11 @@ async function manualSyncFromFirebase(opts) {
         }
       } catch (e) { /* non-critical — header just keeps the local name */ }
     }
+    if (metaBeforePull && typeof metaBeforePull === 'object' && isActiveProfile(p) &&
+        Number(metaBeforePull.generation) > 0) {
+      p.pwaSyncGeneration = Number(metaBeforePull.generation);
+      p.pwaSyncRevision = Number(metaBeforePull.revision || 0);
+    }
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
     if (cfgChanged) renderSettings(); // repaint the whole Settings form from the pulled values
@@ -3726,18 +4041,19 @@ async function manualSyncFromFirebase(opts) {
 
 // ── Polling fallback when SSE fails ──────────────────────────
 let pollingInterval = null;
+function stopPolling() {
+  if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
+}
 function startPolling() {
   if (pollingInterval) return;
   const p = getActiveProfile();
   pollingInterval = setInterval(async () => {
-    if (!p.dbUrl) return;
+    if (!p.dbUrl || document.hidden || profileSwitchInFlight) return; // no reads for a hidden tab
+    if (!isActiveProfile(p)) { stopPolling(); return; }
     const meta = await fbGet('/sync/meta', p);
-    if (meta) {
-      await pwaSyncFromMeta(meta, p);
-      setConnStatus(true);
-    }
+    if (meta) await pwaSyncFromMeta(meta, p);
   }, 10000);
-  startControlPolling();
+  if (!pwaControlPoll) startControlPolling();
 }
 
 // ── Write full room state to Firebase ───────────────────────
@@ -3781,8 +4097,14 @@ async function bumpRoomsUpdatedAt(p) {
 
 // ── Sync V2 coverage helpers ─────────────────────────────────
 function syncV2GenerationToday() {
-  const d = new Date();
-  return Number(String(d.getFullYear()) + String(d.getMonth()+1).padStart(2,'0') + String(d.getDate()).padStart(2,'0'));
+  // The SITE's calendar day (board timezone, IST), not the viewing device's.
+  // Every writer must agree on the generation: with each device using its own
+  // local date, two admins in different timezones (or one tab left open past
+  // midnight) each saw "generation changed", replaced /sync wholesale — wiping
+  // the other's change log — and forced every reader into a full /rooms download.
+  // activate.html computes the same value.
+  const d = new Date(Date.now() + BOARD_UTC_OFFSET_MIN * 60000);
+  return Number(String(d.getUTCFullYear()) + String(d.getUTCMonth()+1).padStart(2,'0') + String(d.getUTCDate()).padStart(2,'0'));
 }
 function syncV2Bucket(bucket) { return bucket === 'slotsT' || bucket === 1 ? 'tomorrow' : 'today'; }
 async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
@@ -3826,16 +4148,28 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
         continue;
       }
       if (!writeRes.ok) throw new Error(await writeRes.text());
+      // This device already holds its own change, so step its cursor past it.
+      // Without this, the revision came straight back over SSE and was fetched
+      // and re-applied — a roomSnapshot re-apply replaced the whole room and
+      // could overwrite edits made in the meantime. (Only when the cursor was
+      // exactly current; after a generation change others need a full refresh.)
+      if (!generationChanged && Number(p.pwaSyncGeneration) === generation &&
+          Number(p.pwaSyncRevision) === revision - 1) {
+        p.pwaSyncRevision = revision;
+      }
       return { revision, generation, updatedAt:now };
     } catch(e) {
       if (attempt === maxAttempts - 1) {
         addLog('error', 'Sync V2 atomic revision failed: ' + e.message);
-        setConnStatus(false);
+        noteNet(false);
         return null;
       }
       await new Promise(resolve => setTimeout(resolve, 60 + Math.floor(Math.random()*140)));
     }
   }
+  // Every attempt lost the ETag race (412) — heavy contention. This used to
+  // return silently, so the caller reported a vague failure with nothing logged.
+  addLog('error', `Sync V2 revision not committed after ${maxAttempts} contended attempts`);
   return null;
 }
 
@@ -3902,6 +4236,7 @@ async function publishRoomSnapshotSyncV2(room, profile, reason) {
 async function resetDailySyncV2(profile, reason) {
   const p = profile || getActiveProfile();
   const generation = syncV2GenerationToday();
+  const resetStartedAt = Date.now();
   const maxAttempts = 8;
   for (let attempt=0; attempt<maxAttempts; attempt++) {
     try {
@@ -3911,6 +4246,13 @@ async function resetDailySyncV2(profile, reason) {
       if (!readRes.ok) throw new Error(await readRes.text());
       const etag = readRes.headers.get('ETag');
       if (!etag) throw new Error('Firebase did not return an ETag for /sync reset');
+      // After a lost race (412) another writer may already have reset this
+      // generation (and appended changes on top). Replacing /sync again would
+      // wipe their revisions, so if a reset for OUR generation landed after we
+      // started, treat the reset as done.
+      const current = await readRes.json();
+      const cm = current && current.meta;
+      if (attempt > 0 && cm && Number(cm.generation) === generation && Number(cm.resetAt) >= resetStartedAt) return true;
       const now=Date.now();
       const replacement={
         meta:{schemaVersion:2,generation,revision:1,resetAt:now,resetReason:reason||'midnight_rollover',updatedAt:now},
@@ -3929,20 +4271,23 @@ async function resetDailySyncV2(profile, reason) {
     } catch(e) {
       if (attempt===maxAttempts-1) {
         addLog('error','Sync V2 atomic reset failed: '+e.message);
-        setConnStatus(false);
+        noteNet(false);
         return false;
       }
       await new Promise(resolve=>setTimeout(resolve,60+Math.floor(Math.random()*140)));
     }
   }
+  addLog('error', `Sync V2 reset not committed after ${maxAttempts} contended attempts`);
   return false;
 }
 
 async function bumpConfigSyncV2(profile, changedKeys) {
   const p = profile || getActiveProfile();
-  const current = await fbGet('/configSync/version', p);
+  // Server-side increment: one request, and two devices saving at once can't
+  // both read N and write N+1 (which lost a bump — the ESP32 then never saw a
+  // new version and skipped the settings refresh).
   return fbPatch('/configSync', {
-    version:Number(current || 0) + 1, updatedAt:Date.now(), changedKeys:changedKeys || []
+    version: { '.sv': { increment: 1 } }, updatedAt: Date.now(), changedKeys: changedKeys || []
   }, p);
 }
 
@@ -3968,9 +4313,14 @@ async function writeRoomSlots(roomId, slotsByIndex, p, extraFields) {
 // caller must surface this, never guess — if the slot can no longer be
 // found at all.
 function showSlotUpdateError(result, actionText) {
-  if (result && result.reason === 'conflict') showToast(`⚠️ This slot changed on another device — Sync before ${actionText}`);
-  else if (result && result.reason === 'not_found') showToast('⚠️ This slot no longer exists in Firebase — Sync required');
-  else if (result && result.reason === 'missing_timestamp') showToast('⚠️ Slot version is missing — Sync before updating');
+  // Each of these means this device's copy of the slot (its slotTs version) no
+  // longer matches Firebase. One tap fetches the latest data and timestamps.
+  // 'conflict' is usually a change this device hasn't received yet → try the
+  // cheap catch-up first. not_found / missing_timestamp mean the stored data
+  // itself lacks what we need, so only a full reload can fix those.
+  if (result && result.reason === 'conflict') showActionToast(`⚠️ This slot changed on another device (version mismatch). Reload to get the latest before you ${actionText}.`, 'Reload', () => reloadLatestData('auto'));
+  else if (result && result.reason === 'not_found') showActionToast('⚠️ This slot no longer exists in Firebase. Reload to get the latest.', 'Reload', () => reloadLatestData('full'));
+  else if (result && result.reason === 'missing_timestamp') showActionToast('⚠️ This slot\'s version timestamp is missing. Reload to fetch it.', 'Reload', () => reloadLatestData('full'));
   else showToast(`⚠️ Could not ${actionText} — check the connection`);
 }
 async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, profile) {
@@ -4406,21 +4756,26 @@ async function pushRoom(idx, profile) {
   r._syncedRecurDefIds = finalDefs.map(d => d.id).filter(Boolean);
 
   const conflict = slotConflict || defConflict;
+
+  if (conflict) {
+    addLog('error', `room${r.id}: a slot/recurring change was overwritten elsewhere — this device's edit was NOT saved; Sync and try again`);
+    showActionToast('⚠️ ' + (r.name || ('Room ' + r.id)) + ': someone else changed this (version mismatch), so your edit was not saved. Reload, then try again.', 'Reload', () => reloadLatestData('auto'));
+  }
+
+  // Publish BEFORE clearing _dirty. It used to be cleared first, so a failed
+  // publish left the room "clean": a later Sync never re-pushed it and other
+  // devices never learned of the change. _dirty also keeps remote echoes from
+  // overwriting this room while the publish is in flight.
+  if (ok) {
+    const syncOk = await publishRoomSnapshotSyncV2(r, p, 'pushRoom');
+    if (!syncOk) ok = false;
+  }
+
   // A conflict means we discarded this device's own edit and adopted
   // Firebase's version instead — there's nothing left of this device's
   // change to retry, so that part of the room is "clean" even though the
   // edit itself didn't survive.
   if ((ok || conflict) && r._dirty) { delete r._dirty; persist(); }
-
-  if (conflict) {
-    addLog('error', `room${r.id}: a slot/recurring change was overwritten elsewhere — this device's edit was NOT saved; Sync and try again`);
-    showToast('⚠️ ' + (r.name || ('Room ' + r.id)) + ': someone else changed this — Sync and try again');
-  }
-
-  if (ok) {
-    const syncOk = await publishRoomSnapshotSyncV2(r, p, 'pushRoom');
-    if (!syncOk) ok = false;
-  }
   addLog(ok ? 'ok' : 'error', `room${r.id} → Firebase`);
   setConnStatus(ok);
   return ok && !conflict;
@@ -4813,7 +5168,7 @@ function reconcileOverride(localRoom, remote) {
   if (remoteOvr !== true && remoteOvr !== false && remoteOvr !== null) return; // ignore junk
   const remoteAt = (typeof remote.overrideAt === 'number') ? remote.overrideAt : 0;
   const localAt  = (typeof localRoom.overrideAt === 'number') ? localRoom.overrideAt : 0;
-  const idx = localRoom.id - 1;
+  const idx = owKey(localRoom.id);
   const lastW = overrideWriteTime[idx] || 0;
   const justSetHere = (Date.now() - lastW) < 30000;
   // Keep local if this device just tapped it, or its timestamp is strictly newer.
@@ -4833,9 +5188,14 @@ function reconcileOverride(localRoom, remote) {
 async function writeOverrideOnly(room, profile) {
   const p = profile || getActiveProfile();
   if (!room) return false;
-  return fbPatch(`/rooms/room${room.id}`, {
-    override: room.override,
-    overrideAt: room.overrideAt
+  // One multi-path PATCH from the profile root: the override itself plus a
+  // /status/overrideSeq server-timestamp. The ESP32 and other PWAs poll that one
+  // tiny marker and only read per-room overrides when it moves, instead of
+  // reading every room every few seconds.
+  return fbPatch('/', {
+    [`rooms/room${room.id}/override`]: room.override,
+    [`rooms/room${room.id}/overrideAt`]: room.overrideAt,
+    'status/overrideSeq': { '.sv': 'timestamp' }
   }, p);
 }
 
@@ -4848,20 +5208,19 @@ async function setOverride(id, val) {
   const now = Date.now();
   r.override = val;
   r.overrideAt = now;
-  overrideWriteTime[id - 1] = now;
+  overrideWriteTime[owKey(id, p)] = now;
   persist(); renderDashboard();
 
   const ok = await writeOverrideOnly(r, p);
   if (ok) {
-    overrideWriteTime[id - 1] = Date.now();
+    overrideWriteTime[owKey(id, p)] = Date.now();
     addLog('ok', `room${id} override → ${val === true ? 'ON' : val === false ? 'OFF' : 'AUTO'}`);
-    setConnStatus(true);
   } else {
     // Roll back only the optimistic override display. Do not dirty the whole
     // room, because a later general push must never be allowed to write override.
     r.override = previousOverride;
     r.overrideAt = previousOverrideAt;
-    overrideWriteTime[id - 1] = 0;
+    overrideWriteTime[owKey(id, p)] = 0;
     persist(); renderDashboard();
     showToast('⚠️ Could not update room override — previous status restored');
   }
@@ -4872,28 +5231,28 @@ async function allRooms(val) {
   const now = Date.now();
   const previous = state.rooms.map(r => ({ id:r.id, override:r.override, overrideAt:r.overrideAt }));
   const patch = {};
-  state.rooms.forEach((r, i) => {
+  state.rooms.forEach(r => {
     r.override = val;
     r.overrideAt = now;
-    overrideWriteTime[i] = now;
+    overrideWriteTime[owKey(r.id, p)] = now;
     patch[`rooms/room${r.id}/override`] = val;
     patch[`rooms/room${r.id}/overrideAt`] = now;
   });
+  patch['status/overrideSeq'] = { '.sv': 'timestamp' }; // see writeOverrideOnly()
   persist(); renderDashboard();
 
   // One atomic multi-path PATCH containing override fields only. No slots,
   // recurring definitions, room metadata or Sync V2 snapshot is touched.
   const ok = await fbPatch('/', patch, p);
   if (ok) {
-    state.rooms.forEach((r, i) => { overrideWriteTime[i] = Date.now(); });
+    state.rooms.forEach(r => { overrideWriteTime[owKey(r.id, p)] = Date.now(); });
     addLog('ok', `all rooms override → ${val === true ? 'ON' : val === false ? 'OFF' : 'AUTO'}`);
-    setConnStatus(true);
     showToast(val === true ? 'All ON' : val === false ? 'All OFF' : 'All Auto');
   } else {
     previous.forEach(prev => {
       const r = state.rooms.find(room => room.id === prev.id);
       if (r) { r.override = prev.override; r.overrideAt = prev.overrideAt; }
-      overrideWriteTime[prev.id - 1] = 0;
+      overrideWriteTime[owKey(prev.id, p)] = 0;
     });
     persist(); renderDashboard();
     showToast('⚠️ Could not update all overrides — previous statuses restored');
@@ -5661,6 +6020,10 @@ async function switchProfile(id) {
   if (id === state.activeProfileId) return;
   const p = state.profiles.find(x => x.id === id);
   if (!p) return;
+  // Background timers skip work until this switch has its profile number and
+  // listener ready (see profileSwitchInFlight).
+  profileSwitchInFlight = true;
+  try {
   resetConnectionForProfileChange();
   // Save the outgoing profile's rooms under its own id before switching
   // away, then restore the incoming profile's own rooms — falling back to
@@ -5680,15 +6043,22 @@ async function switchProfile(id) {
                               // if the Timeline tab is the one currently open
   addLog('ok', `Switched to profile "${p.name}"`);
   showToast(`Switched to ${p.name} — connecting…`);
-  controllerLastSeenStr = null; // reset board-health for the new profile
+  controllerLastSeenMs = null; // reset board-health for the new profile
   const csEl = document.getElementById('controllerStatus'); if (csEl) csEl.style.display = 'none';
   if (p.dbUrl) {
     await ensureProfileNumber(p); // must resolve before the listener opens, so it reads the right /profiles/{n} path
     persist();
+    // Number is known now — background work may resume for this profile.
+    profileSwitchInFlight = false;
     startFbListener();
-    await startPwaSyncV2();
-    checkDailySlotRefresh(p); // full read only when rollover marker changed
-    refreshControllerStatus(); // board health for the newly-active profile
+    await startPwaSyncV2(p);
+    if (isActiveProfile(p)) {
+      checkDailySlotRefresh(p); // full read only when rollover marker changed
+      refreshControllerStatus(); // board health for the newly-active profile
+    }
+  }
+  } finally {
+    profileSwitchInFlight = false;
   }
 }
 
@@ -5731,9 +6101,15 @@ function deleteProfile(id) {
 }
 
 function resetConnectionForProfileChange() {
-  if (fbListener) { fbListener.close(); fbListener = null; }
-  if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
+  stopFbListener();
+  stopPolling();
   if (pwaControlPoll) { clearInterval(pwaControlPoll); pwaControlPoll = null; }
+  // Per-profile polling memory must not carry over to the next profile.
+  pwaSyncPending = null;
+  lastOverrideSeqSeen = null;
+  lastOverrideFullCheck = 0;
+  sseRetryDelay = 2000;
+  netFailStreak = 0;
   setConnStatus(false);
   qrGenerated = false;
   document.getElementById('qrHidden').style.display = 'none';
@@ -5757,7 +6133,13 @@ async function saveActiveProfile() {
   // profile there (writing /profiles/{n}/name). Without this, the save reused
   // the stale number, never created the profile node in the new db, and the
   // data appeared not to save.
-  if (prevDbUrl !== p.dbUrl) p.fbNum = null;
+  if (prevDbUrl !== p.dbUrl) {
+    p.fbNum = null;
+    // The Sync V2 cursor belongs to the OLD database; against the new one it
+    // would be read as "already up to date" or as a bogus gap.
+    p.pwaSyncGeneration = 0;
+    p.pwaSyncRevision = 0;
+  }
   p.apiKey    = document.getElementById('cfg-key').value.trim();
   p.adminSeed = document.getElementById('cfg-seed').value.trim() || '1234';
   p.whatsappTemplate = document.getElementById('cfg-whatsapp-template').value.trim() || DEFAULT_WHATSAPP_TEMPLATE;
@@ -5798,7 +6180,10 @@ async function saveActiveProfile() {
             // physical relay, so this can never be a valid saved state
   }
   persist();
-  if (p.dbUrl) await ensureProfileNumber(p); // before finishSaveSettings, which pushes room data using this profile's number
+  if (p.dbUrl) { // before finishSaveSettings, which pushes room data using this profile's number
+    profileSwitchInFlight = true; // timers must not touch an un-numbered (root) path meanwhile
+    try { await ensureProfileNumber(p); } finally { profileSwitchInFlight = false; }
+  }
   persist();
   finishSaveSettings(p, `Saved changes to "${p.name}"`);
 }
@@ -5823,7 +6208,10 @@ async function saveAsNewProfile() {
   state.activeProfileId = p.id; // ensureProfileNumber below resolves against getActiveProfile(), so this must be set first
   state.rooms = makeBlankRooms();
   persist();
-  if (p.dbUrl) await ensureProfileNumber(p);
+  if (p.dbUrl) {
+    profileSwitchInFlight = true;
+    try { await ensureProfileNumber(p); } finally { profileSwitchInFlight = false; }
+  }
   persist();
   finishSaveSettings(p, `Created profile "${p.name}"`);
 }
@@ -5871,29 +6259,43 @@ function checkMissingRelayPins() {
 function finishSaveSettings(p, message) {
   // Push seed to Firebase so activate.html can compute admin code
   if (p.dbUrl) {
-    fbSet('/config/adminSeed', p.adminSeed, p);
-    fbSet('/config/emergencyPin', p.emergencyPin === null || p.emergencyPin === undefined ? null : p.emergencyPin, p);
-    fbSet('/config/emergencyTimeout', p.emergencyTimeout === null || p.emergencyTimeout === undefined ? null : p.emergencyTimeout, p);
-    fbSet('/config/activateWindowHours', p.activateWindowHours === null || p.activateWindowHours === undefined ? null : p.activateWindowHours, p);
-    fbSet('/config/autoApproveBookings', !!p.autoApproveBookings, p);
-    fbSet('/config/beeperPin', p.beeperPin === null || p.beeperPin === undefined ? null : p.beeperPin, p);
-    fbSet('/config/warnMinutes', p.warnMinutes === null || p.warnMinutes === undefined ? null : p.warnMinutes, p);
-    fbSet('/config/beepMs', p.beepMs === null || p.beepMs === undefined ? null : p.beepMs, p);
-    fbSet('/config/beepCount', p.beepCount === null || p.beepCount === undefined ? null : p.beepCount, p);
-    // Also push the WhatsApp + relay-wiring settings so the manual Sync on
-    // another device can pull them back (Firebase authoritative for all
-    // Settings-page values). relayWiring is also written on its own toggle;
-    // writing it here too keeps /config complete after any Save.
-    fbSet('/config/whatsappTemplate', p.whatsappTemplate || DEFAULT_WHATSAPP_TEMPLATE, p);
-    fbSet('/config/whatsappCountryCode', p.whatsappCountryCode || '91', p);
-    fbSet('/config/relayWiring', p.relayWiring || 'NC', p);
-    bumpConfigSyncV2(p, [
-      'adminSeed','emergencyPin','emergencyTimeout','activateWindowHours','autoApproveBookings',
-      'beeperPin','warnMinutes','beepMs','beepCount','whatsappTemplate',
-      'whatsappCountryCode','relayWiring','rooms'
-    ]).catch(() => {});
+    const nz = v => (v === null || v === undefined) ? null : v;
+    // ONE PATCH for every setting (was 12 separate PUTs). A null value removes
+    // the key, exactly as PUT null did. Also push the WhatsApp + relay-wiring
+    // settings so the manual Sync on another device can pull them back
+    // (Firebase authoritative for all Settings-page values); relayWiring is also
+    // written on its own toggle, writing it here keeps /config complete.
+    const configPatch = {
+      adminSeed: p.adminSeed,
+      emergencyPin: nz(p.emergencyPin),
+      emergencyTimeout: nz(p.emergencyTimeout),
+      activateWindowHours: nz(p.activateWindowHours),
+      autoApproveBookings: !!p.autoApproveBookings,
+      beeperPin: nz(p.beeperPin),
+      warnMinutes: nz(p.warnMinutes),
+      beepMs: nz(p.beepMs),
+      beepCount: nz(p.beepCount),
+      whatsappTemplate: p.whatsappTemplate || DEFAULT_WHATSAPP_TEMPLATE,
+      whatsappCountryCode: p.whatsappCountryCode || '91',
+      relayWiring: p.relayWiring || 'NC'
+    };
+    (async () => {
+      // The version bump must come AFTER the values land: the ESP32 re-reads
+      // /config as soon as it sees the new version, and used to race the writes.
+      const written = await fbPatch('/config', configPatch, p);
+      if (written) {
+        await bumpConfigSyncV2(p, [
+          'adminSeed','emergencyPin','emergencyTimeout','activateWindowHours','autoApproveBookings',
+          'beeperPin','warnMinutes','beepMs','beepCount','whatsappTemplate',
+          'whatsappCountryCode','relayWiring','rooms'
+        ]);
+      }
+    })();
     pushAllRooms(p);
     startFbListener();
+    // The listener's first event normally performs the sync, but a profile whose
+    // database just changed (cursor cleared) must not depend on that.
+    if (!p.pwaSyncGeneration) startPwaSyncV2(p);
   }
   updateHeaderProfile();
   renderDashboard();
@@ -6149,19 +6551,36 @@ function setConnStatus(ok) {
 }
 
 // ── Controller (ESP32 board) health ───────────────────────────
-// The board writes /status/lastSeen ("YYYY-MM-DD HH:MM:SS", local time) every
-// 5-minute heartbeat. If we haven't seen an update within the threshold, the
-// board is likely down (power/WiFi). NOTE: this is separate from the header's
-// Live/Offline dot, which only reflects THIS browser's link to Firebase.
+// The board sends a heartbeat to /status every 5 minutes: lastSeenEpoch (UTC
+// seconds — timezone-proof) plus lastSeen ("YYYY-MM-DD HH:MM:SS" board-local
+// text, which older firmware sends alone). If no heartbeat is seen within the
+// threshold the board is likely down (power/WiFi). NOTE: this is separate from
+// the header's Live/Offline dot, which only reflects THIS browser's link to Firebase.
+//
+// The heartbeat is read as part of pollRoomControlsOnce()'s single /status GET —
+// there is no separate heartbeat request any more.
 const CONTROLLER_STALE_MINUTES = 11; // > 2 missed 5-min heartbeats
-let controllerLastSeenStr = null;    // last value read from Firebase
+let controllerLastSeenMs = null;     // UTC ms of the last heartbeat, null = none seen
+// The legacy text has no timezone, and the firmware is fixed to IST (+05:30).
+// It used to be parsed as the VIEWER's local time, so any viewer outside IST saw
+// a healthy board as hours stale — or, east of IST, a dead one as "online".
+const BOARD_UTC_OFFSET_MIN = 330;
 
-// Parse the board's "YYYY-MM-DD HH:MM:SS" (local time) into a Date, or null.
+// Parse the board's "YYYY-MM-DD HH:MM:SS" (IST) into UTC ms, or null.
 function parseControllerTs(s) {
   if (!s || typeof s !== 'string') return null;
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/);
   if (!m) return null;
-  return new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]);
+  return Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]) - BOARD_UTC_OFFSET_MIN * 60000;
+}
+
+// Take the /status node read from Firebase (null = node doesn't exist yet).
+function applyControllerStatus(st) {
+  let ms = null;
+  if (st && typeof st.lastSeenEpoch === 'number' && st.lastSeenEpoch > 1e9) ms = st.lastSeenEpoch * 1000;
+  else if (st && typeof st.lastSeen === 'string') ms = parseControllerTs(st.lastSeen);
+  controllerLastSeenMs = ms;
+  renderControllerStatus();
 }
 
 // Re-render the pill from the last-read timestamp. Called on a timer so it
@@ -6169,36 +6588,68 @@ function parseControllerTs(s) {
 function renderControllerStatus() {
   const el = document.getElementById('controllerStatus');
   if (!el) return;
+  if (profileSwitchInFlight) return;   // don't flash "unknown" mid-switch
   const p = getActiveProfile();
   if (!p || !p.dbUrl) { el.style.display = 'none'; return; }
-  const ts = parseControllerTs(controllerLastSeenStr);
-  if (!ts) {
-    el.className = 'ctrl-status unknown';
-    el.textContent = '○ Controller status unknown — no heartbeat yet';
-    el.style.display = '';
+  if (controllerLastSeenMs === null) {
+    setCtrlBar(el, 'unknown', '○ Controller status unknown — no heartbeat yet', true);
     return;
   }
-  const mins = Math.floor((Date.now() - ts.getTime()) / 60000);
-  if (mins >= CONTROLLER_STALE_MINUTES) {
-    el.className = 'ctrl-status stale';
-    el.textContent = `⚠️ Controller not responding — last seen ${mins} min ago`;
-    el.style.display = '';
+  // "Now" on the SERVER's clock when Firebase told us its time (serverClockOffsetMs
+  // is 0 otherwise). A phone with a wrong date/time used to make a healthy board
+  // look stale, or a dead one look online — a timestamp mismatch the user could
+  // only fix by correcting the device clock.
+  const mins = Math.floor((Date.now() + serverClockOffsetMs - controllerLastSeenMs) / 60000);
+  if (mins < -5) {
+    // Heartbeat is from the future: this device's clock is behind. Don't claim
+    // "online" on a timestamp we can't trust.
+    setCtrlBar(el, 'unknown', '○ Controller time doesn\'t match this device — check its date & time', true);
+  } else if (mins >= CONTROLLER_STALE_MINUTES) {
+    setCtrlBar(el, 'stale', mins >= 120
+      ? `⚠️ Controller not responding — last seen ${Math.floor(mins / 60)} h ago`
+      : `⚠️ Controller not responding — last seen ${mins} min ago`, true);
   } else {
-    el.className = 'ctrl-status online';
-    el.textContent = '● Controller online';
-    el.style.display = '';
+    setCtrlBar(el, 'online', '● Controller online', false);
   }
 }
 
-// Fetch the latest heartbeat for the active profile, then render.
-async function refreshControllerStatus() {
-  const p = getActiveProfile();
-  if (!p || !p.dbUrl) { renderControllerStatus(); return; }
-  try {
-    const v = await fbGet('/status/lastSeen', p);
-    controllerLastSeenStr = (typeof v === 'string') ? v : null;
-  } catch (e) { /* leave last known value; timer will re-evaluate */ }
-  renderControllerStatus();
+// Draws the status pill; the Reload button (fetch the latest heartbeat now) is
+// offered whenever the state is not a clean "online".
+function setCtrlBar(el, cls, text, withReload) {
+  el.className = 'ctrl-status ' + cls;
+  el.textContent = text;
+  if (withReload) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ctrl-reload';
+    b.textContent = 'Reload';
+    b.setAttribute('aria-label', 'Reload controller status');
+    b.onclick = reloadControllerStatus;
+    el.appendChild(b);
+  }
+  el.style.display = '';
+}
+
+async function reloadControllerStatus(ev) {
+  const b = ev && ev.currentTarget;
+  if (b) { b.disabled = true; b.textContent = 'Loading…'; }
+  const before = controllerLastSeenMs;
+  // A background poll may already be mid-flight (pollRoomControlsOnce skips
+  // overlapping calls); let it land first so this click always gets a fresh read.
+  for (let i = 0; i < 25 && controlPollInFlight; i++) await new Promise(r => setTimeout(r, 200));
+  await pollRoomControlsOnce(true);   // one /status read → heartbeat, lights, overrides
+  // The bar was re-rendered by the poll. If nothing newer arrived, say so —
+  // otherwise the button looks like it did nothing.
+  if (controllerLastSeenMs === before) {
+    const el = document.getElementById('controllerStatus');
+    if (el && !el.classList.contains('online')) showToast('No newer heartbeat yet — check the board\'s power and WiFi');
+  }
+}
+
+// One /status read updates the bar, the lights and (if needed) the overrides.
+// Kept under its old name for the callers that just want "refresh now".
+function refreshControllerStatus() {
+  return pollRoomControlsOnce(true);
 }
 
 // ── Navigation ────────────────────────────────────────────────
@@ -6221,6 +6672,67 @@ function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// A message plus a button that fixes it. Used for version/timestamp mismatches,
+// where "Sync and try again" used to leave the user to find the Sync button in
+// Settings themselves. onAction may be async; the button shows "Loading…" until
+// it finishes, then the toast closes.
+let actionToastTimer = null;
+function hideActionToast() {
+  clearTimeout(actionToastTimer);
+  const el = document.getElementById('actionToast');
+  if (el) el.classList.remove('show');
+}
+function showActionToast(msg, label, onAction, ms) {
+  const el = document.getElementById('actionToast');
+  if (!el) { showToast(msg); return; }
+  const btn = document.getElementById('actionToastBtn');
+  document.getElementById('actionToastMsg').textContent = msg;
+  btn.textContent = label || 'Reload';
+  btn.disabled = false;
+  btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = 'Loading…';
+    try { await onAction(); } finally { hideActionToast(); }
+  };
+  document.getElementById('actionToastClose').onclick = hideActionToast;
+  el.classList.add('show');
+  clearTimeout(actionToastTimer);
+  actionToastTimer = setTimeout(hideActionToast, ms || 20000);
+}
+// "Reload latest" behind the Reload buttons.
+//   mode 'auto' — try the cheap Sync V2 catch-up first (one /sync/meta read plus
+//     only the changes this device missed). Used ONLY when it can explain the
+//     mismatch: same day's log, this device's cursor BEHIND Firebase's, and no
+//     unsaved local edits. If the cursor is already current, a missing change
+//     isn't the cause (something diverged without a log entry), so re-applying
+//     nothing would just leave the mismatch — go straight to the full reload.
+//   mode 'full' (default) — manualSyncFromFirebase(): push unsaved edits, then
+//     replace local slots (with fresh slotTs versions), overrides and settings
+//     from Firebase.
+// Either way, if the incremental path doesn't end up current it falls back to full.
+async function reloadLatestData(mode) {
+  const p = getActiveProfile();
+  if (mode === 'auto' && p && p.dbUrl && !state.rooms.some(r => r._dirty)) {
+    const meta = await fbGet('/sync/meta', p);
+    if (!isActiveProfile(p)) return;
+    if (meta && typeof meta === 'object') {
+      const remoteGen = Number(meta.generation || 0);
+      const remoteRev = Number(meta.revision || 0);
+      const localRev = Number(p.pwaSyncRevision || 0);
+      const behind = localRev > 0 && Number(p.pwaSyncGeneration || 0) === remoteGen && localRev < remoteRev;
+      if (behind) {
+        await pwaSyncFromMeta(meta, p);
+        // pwaSyncFromMeta queues if a sync is already running — wait it out.
+        for (let i = 0; i < 25 && (pwaSyncInFlight || pwaSyncPending); i++) await new Promise(r => setTimeout(r, 200));
+        if (isActiveProfile(p) && Number(p.pwaSyncRevision || 0) >= remoteRev) {
+          showToast(`✓ Caught up — ${remoteRev - localRev} change${remoteRev - localRev === 1 ? '' : 's'} applied`);
+          return;
+        }
+      }
+    }
+  }
+  return manualSyncFromFirebase();
 }
 
 // ── Clock ─────────────────────────────────────────────────────
@@ -6428,9 +6940,8 @@ function bootApp() {
     if (document.getElementById('page-dashboard').classList.contains('active')) renderDashboard();
     if (document.getElementById('page-timeline').classList.contains('active'))  renderTimeline();
   }, 30000);
-  // Controller health: re-fetch the board's heartbeat every 2 min, and
-  // re-evaluate the pill every 30s so it turns stale on its own between fetches.
-  setInterval(refreshControllerStatus, 120000);
+  // Controller health: the heartbeat arrives with the 10 s /status poll; just
+  // re-evaluate the pill every 30 s so it turns stale on its own if polling stops.
   setInterval(renderControllerStatus, 30000);
 
   if (getActiveProfile().dbUrl) {
@@ -6483,8 +6994,8 @@ function applyUpdate() {
   }
 }
 </script>
-  <!-- QR library loaded async — does not block page render -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+  <!-- QR library vendored locally (offline-first) — loaded async, does not block page render -->
+  <script src="js/qrcode.min.js" defer></script>
 
 
   <!-- ── Recurring schedule modal ─────────────────────────────── -->
