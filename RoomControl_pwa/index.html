@@ -3335,7 +3335,21 @@ async function applyPwaSyncV2Change(revision, change, p) {
     // slotTs tracking /rooms, the store the version check reads. (A brand-new slot
     // has no /rooms baseline yet, so it keeps the canonical slotTs.) This stops a
     // store that stamped slotTs on only one side from causing a false conflict.
-    const mergeExisting = c => { const m = { ...list[idx], ...c }; m.slotTs = list[idx].slotTs; return m; };
+    // The canonical record is the slot's FULL authoritative state. Merge it over
+    // the local slot, but note Firebase DROPS null fields on write — so a
+    // DEACTIVATION (activatedAt:null) produces a canonical with NO activatedAt
+    // key at all. A plain spread would then leave the local slot's STALE
+    // activatedAt in place, so the other device keeps showing "Active" (the
+    // reported "one active, one deactivated" bug). For the clearable activation
+    // fields, treat "absent in canonical" as "cleared → null", not "unchanged".
+    // slotTs is still pinned to the local value (the /rooms optimistic-lock token).
+    const CLEARABLE = ['activatedAt', 'activatedBy', 'lockedUntil'];
+    const mergeExisting = c => {
+      const m = { ...list[idx], ...c };
+      CLEARABLE.forEach(f => { if (!(f in c)) m[f] = null; });
+      m.slotTs = list[idx].slotTs;
+      return m;
+    };
     if (canonical.deleted || change.operation === 'delete') {
       if (idx >= 0) list[idx] = { ...mergeExisting(canonical), deleted:true };
       else if (hasTimes) list.push({ ...canonical, deleted:true });
