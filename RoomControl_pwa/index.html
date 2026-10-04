@@ -4542,7 +4542,19 @@ async function pushRoom(idx, profile) {
     if (!remote && syncedSlotIds.has(sl.id)) continue;
 
     const patch = buildSlotPatch(sl);
-    patch.slotTs = Date.now();
+    // slotTs is the optimistic-lock token updateSlotById() checks against
+    // /rooms. Only MINT a new one for a slot whose version actually changes:
+    // a brand-new slot (no remote match). For an id-matched slot we reach here
+    // only when remote.slotTs === sl.slotTs (the mismatch case already took the
+    // conflict branch above and continued), i.e. this push is NOT changing the
+    // slot's version — so carry the existing slotTs forward. Previously this
+    // always stamped Date.now(), so pushRoom (fired by editing a SIBLING slot,
+    // a schedule change, a dirty-room Sync, etc.) bumped /rooms' slotTs for the
+    // already-activated slot WITHOUT touching /slotRecords or expecting it in
+    // local — the next activate/deactivate tap then saw a false "changed on
+    // another device". activatedAt/attempts/etc. are untouched here anyway, so
+    // an id-matched unchanged slot genuinely needs no new version.
+    patch.slotTs = (remote && typeof remote.slotTs === 'number') ? remote.slotTs : Date.now();
     // expired IS explicitly reset here (unlike activatedAt/attempts/
     // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
     // touches fields it's given, so without this a slot that reuses a
