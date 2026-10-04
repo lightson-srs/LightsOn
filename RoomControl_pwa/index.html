@@ -4194,8 +4194,14 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
   const maxAttempts = 4;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      const sync = (await fbGet('/sync', p)) || {};
-      const oldMeta = sync.meta || {};
+      // Read only /sync/meta (two fields) to compute the next revision — NOT the
+      // whole /sync node, which also pulls the entire day's /sync/changes log.
+      // That log is never trimmed within a day, so reading all of /sync here made
+      // every slot/activation/booking write progressively heavier as the day went
+      // on. /sync/meta is a strict subtree of /sync, so meta.revision is the exact
+      // same value either way (verified) — this changes only how much is
+      // downloaded, never which revision number we compute.
+      const oldMeta = (await fbGet('/sync/meta', p)) || {};
       const generationChanged = Number(oldMeta.generation) !== generation;
       const now = Date.now();
       const revision = generationChanged ? 2 : Number(oldMeta.revision || 1) + 1;
@@ -4766,8 +4772,14 @@ async function pushRoom(idx, profile) {
   // update/delete under the target path, so this is the exact same
   // semantics as the old per-index fbPatch/fbSet calls, just batched. Routed
   // through writeRoomSlots() so this write also bumps slotsUpdatedAt.
+  // Track whether writeRoomSlots already bumped /config/roomsUpdatedAt, so the
+  // slotsT write below doesn't bump it a SECOND time in the same push (one
+  // marker bump per push is enough for request.html/activate.html to invalidate
+  // their cache — the double bump was a redundant /config write every save).
+  let roomsMarkerBumped = false;
   if (Object.keys(writeMap).length > 0) {
     ok = await writeRoomSlots(r.id, writeMap, p) && ok;
+    roomsMarkerBumped = true;
   }
   r.slots[0] = finalSlots;
   r._syncedSlotIds = finalSlots.map(sl => sl.id).filter(Boolean);
@@ -4793,7 +4805,9 @@ async function pushRoom(idx, profile) {
       days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null
     };
   });
-  await bumpRoomsUpdatedAt(p); // slotsT changed — request.html's availability view needs to know
+  // Bump the rooms marker only if the slots write above didn't already (avoids
+  // the duplicate /config write when both today-slots and slotsT change in one push).
+  if (!roomsMarkerBumped) { await bumpRoomsUpdatedAt(p); roomsMarkerBumped = true; }
   ok = await fbPatch(roomBase, { slotsT }, p) && ok;
 
   // ── Recurring definitions — merge by id, optimistic-lock by defTs ─────
