@@ -4184,6 +4184,46 @@ function syncV2GenerationToday() {
   return Number(String(d.getUTCFullYear()) + String(d.getUTCMonth()+1).padStart(2,'0') + String(d.getUTCDate()).padStart(2,'0'));
 }
 function syncV2Bucket(bucket) { return bucket === 'slotsT' || bucket === 1 ? 'tomorrow' : 'today'; }
+
+// How many trailing revisions of /sync/changes to KEEP available for incremental
+// catch-up. A device that fell behind replays changes/{cursor+1 .. head}; if any
+// needed revision has been trimmed, pwaSyncCore / ESP32 syncSlotsV2 detect the
+// gap and fall back to a full /rooms refresh (correct, but heavier). 50 is far
+// larger than any realistic catch-up gap here — every device re-reads /sync/meta
+// at least every ~30 s and the admin PWA is effectively the single writer — so a
+// device would have to miss ~50 consecutive mutations in under 30 s to be forced
+// into a full refresh. Within that window nothing is deleted, so trimming never
+// changes correctness, only caps the stored node size.
+const SYNC_V2_CHANGES_KEEP = 50;
+
+// Delete /sync/changes entries older than the keep-window. Fire-and-forget: a
+// failed trim is harmless (the entries simply linger until the midnight reset
+// replaces /sync wholesale — exactly today's behaviour), so it must never delay
+// or fail the revision publish that just succeeded. Deletes a small trailing
+// batch below the floor rather than one entry, so if an earlier trim was skipped
+// (offline, error) the backlog still converges instead of leaking forever.
+// Revision 1 (the FULL_SYNC marker) is never touched — it's the generation anchor.
+function trimSyncV2Changes(profile, headRevision) {
+  const floor = headRevision - SYNC_V2_CHANGES_KEEP;   // highest revision to delete
+  if (floor < 2) return;                               // nothing old enough yet (keep rev 1)
+  const BATCH = 10;                                    // clean up to 10 stale entries per publish
+  const patch = {};
+  for (let r = floor; r > floor - BATCH && r >= 2; r--) {
+    patch[`changes/${r}`] = null;
+  }
+  // Direct silent fetch rather than fbPatch: this is opportunistic background
+  // cleanup, so a failure must NOT log an error or flip the connection dot to
+  // "Offline" (fbPatch does both on failure). Not awaited — the publish already
+  // succeeded; if this never lands the entries just wait for the midnight reset.
+  try {
+    fetch(fbUrl('/sync', profile), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(patch)
+    }).catch(() => {});
+  } catch(e) { /* ignore — cleanup is best-effort */ }
+}
+
 // Append one Sync V2 change and advance the revision.
 //
 // NOTE on atomicity: Firebase RTDB's REST API only accepts the `If-Match`
@@ -4231,6 +4271,10 @@ async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
       if (!ok) throw new Error('PATCH /sync failed');
       // DIAGNOSTIC: confirm what we told /sync/meta the head revision is.
       addLog('ok', `Sync V2 published rev ${revision} (meta/revision set to ${revision})`);
+      // Trim the /sync/changes backlog so it can't grow unbounded within a day.
+      // Only on the incremental branch — the generation-change branch already
+      // replaced /sync wholesale, so there is nothing stale to trim.
+      if (!generationChanged) trimSyncV2Changes(p, revision);
       // This device already holds its OWN change, so step its reader cursor past
       // it to avoid re-fetching the SSE echo. CRITICAL: only do this when THIS
       // write builds directly on the cursor — i.e. the revision we just read
