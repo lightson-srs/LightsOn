@@ -3621,6 +3621,7 @@ window.addEventListener('offline', () => setConnStatus(false));
 let controlPollInFlight = false;
 let lastOverrideSeqSeen = null;   // reset per profile in resetConnectionForProfileChange()
 let lastOverrideFullCheck = 0;
+let lastSelfHealCheck = 0;        // throttles the /sync/meta trailing-miss check to ~30s
 async function pollRoomControlsOnce(force) {
   const p = getActiveProfile();
   if (!p || !p.dbUrl || profileSwitchInFlight) return;
@@ -3676,19 +3677,27 @@ async function pollRoomControlsOnce(force) {
     if (changed) { persist(); renderDashboard(); }
 
     // Sync V2 self-heal: the live SSE path can miss the LAST change of a burst
-    // (it arrives mid-sync and is coalesced, or is lost across a reconnect, with
-    // no later event to retrigger). Piggyback a tiny /sync/meta read on this
-    // existing 10 s poll: if the remote revision is ahead of our cursor, catch
-    // up now — so a missed slot activation self-heals within ~10 s without a
-    // reload, and without any full /rooms fallback.
-    const sm = await fbGetOrUndef('/sync/meta', p);
-    if (isActiveProfile(p) && sm && typeof sm === 'object') {
-      const remoteGen = Number(sm.generation || 0);
-      const remoteRev = Number(sm.revision || 0);
-      const localGen = Number(p.pwaSyncGeneration || 0);
-      const localRev = Number(p.pwaSyncRevision || 0);
-      if (remoteGen > 0 && (remoteGen !== localGen || remoteRev > localRev)) {
-        pwaSyncFromMeta(sm, p); // not awaited — it guards its own in-flight state
+    // (coalesced mid-sync, or lost across a reconnect, with no later event to
+    // retrigger — and keep-alives keep the stream "alive" so sseWatchdog won't
+    // notice). A tiny /sync/meta read catches that: if the remote revision is
+    // ahead of our cursor, catch up — no reload, no /rooms fallback.
+    //
+    // This runs on its OWN 30 s cadence, NOT every 10 s control tick. The 10 s
+    // tick is for the live /status read (heartbeat/lights/override); the
+    // trailing-miss safety net only needs ~30 s freshness for a lighting app,
+    // so throttling it here cuts this /sync/meta read from 6/min to 2/min per
+    // device. A forced poll (reload/resume) always runs it immediately.
+    if (force === true || now - lastSelfHealCheck >= 30000) {
+      lastSelfHealCheck = now;
+      const sm = await fbGetOrUndef('/sync/meta', p);
+      if (isActiveProfile(p) && sm && typeof sm === 'object') {
+        const remoteGen = Number(sm.generation || 0);
+        const remoteRev = Number(sm.revision || 0);
+        const localGen = Number(p.pwaSyncGeneration || 0);
+        const localRev = Number(p.pwaSyncRevision || 0);
+        if (remoteGen > 0 && (remoteGen !== localGen || remoteRev > localRev)) {
+          pwaSyncFromMeta(sm, p); // not awaited — it guards its own in-flight state
+        }
       }
     }
   } finally {
