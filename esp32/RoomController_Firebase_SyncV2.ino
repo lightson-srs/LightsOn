@@ -6,6 +6,15 @@
  *             LittleFS (bundled with modern ESP32 board packages),
  *             WiFi, HTTPClient, WiFiClientSecure (all built-in)
  *
+ *  v6.8 — HTTPS connection reuse (persistent TLS client):
+ *  - fbGet/fbPut/fbPatch share one long-lived WiFiClientSecure + HTTPClient
+ *    with setReuse(true), so the TLS handshake (and its ~3-5 KB cert-chain
+ *    download) runs ONCE instead of on every poll. Cuts RTDB "downloaded"
+ *    volume dramatically at the SAME poll rate — the handshake, not the tiny
+ *    JSON body, was the real cost. A transport failure (stale/dropped socket)
+ *    triggers a single clean-reconnect retry, so robustness is unchanged.
+ *  - No change to the Sync V2 data contract or poll intervals.
+ *
  *  v6.7 — 40 slots/room + validated missing-version recovery:
  *  - Beeper is active-low and driven only by its timed state machine.
  *  - GPIO configuration/read checks never call digitalWrite().
@@ -175,6 +184,25 @@ int warnMinutes = 0;   // 0 or negative = feature disabled
 #define BEEPER_OFF HIGH
 
 String firebaseUrl;  // e.g. https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app
+
+// ── Persistent HTTPS transport (connection reuse) ─────────────
+// Every fbGet/fbPut/fbPatch used to create a stack-local WiFiClientSecure and
+// call http.begin()/http.end() per request. Because setInsecure() skips cert
+// validation but the TLS HANDSHAKE still happens, each poll performed a full
+// TLS 1.2 handshake (TCP connect + ServerHello + ~3-5 KB certificate chain +
+// key exchange) just to transfer a ~15-byte body — a ~200x overhead that
+// Firebase meters as "downloaded". At a 3 s override poll that handshake, not
+// the data, was the dominant source of daily RTDB download volume.
+//
+// These two objects are now long-lived and shared. With http.setReuse(true)
+// the underlying TLS socket stays open across requests, so the handshake runs
+// ONCE and subsequent polls ride the already-open connection (just HTTP headers
+// + the tiny JSON on the wire). fbRequest() below centralises reuse + a single
+// reconnect-on-stale retry so one dropped idle socket still just fails one poll
+// (today's robustness) instead of wedging sync.
+WiFiClientSecure fbClient;
+HTTPClient       fbHttp;
+bool             fbClientReady = false;   // TLS client configured (setInsecure done once)
 
 // Profiles sharing one Firebase project are namespaced under /profiles/{n} —
 // set once during setup (matches whatever number the PWA's Settings page
@@ -464,47 +492,83 @@ String profilePrefix() {
   return profileNum.length() > 0 ? "/profiles/" + profileNum : "";
 }
 
-String fbGet(String path) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, firebaseUrl + profilePrefix() + path + ".json");
-  http.setTimeout(5000);
-  int code = http.GET();
-  String result = "error";
-  if (code == 200) {
-    result = http.getString();
-    result.trim();
-  } else {
-    Serial.printf("fbGet failed %s code=%d\n", path.c_str(), code);
+// Force the shared TLS connection closed, so the next request does a fresh
+// handshake. Used after a transport-level failure (stale/dropped keep-alive
+// socket) and whenever the Firebase URL/profile changes.
+void fbResetConnection() {
+  fbHttp.end();           // with reuse=true this would normally keep the socket;
+  fbClient.stop();        // stop() forces the underlying TLS socket closed.
+  fbClientReady = false;
+}
+
+// One shared request path for GET/PUT/PATCH so connection reuse + the
+// reconnect-on-stale retry live in exactly one place.
+//
+// method : "GET" | "PUT" | "PATCH"
+// body   : payload for PUT/PATCH (ignored for GET)
+// out    : receives the response body on a 200 GET (nullptr for writes)
+// returns: HTTP status code (>=100), or a negative HTTPClient transport error.
+//
+// A reused idle socket that the server/NAT has silently dropped surfaces as a
+// NEGATIVE code (HTTPC_ERROR_*), not an HTTP status. On that first failure we
+// tear the connection down and retry ONCE with a fresh handshake — so a dropped
+// keep-alive costs at most one extra reconnect, never a wedged poll. A real
+// HTTP error (404, 401, ...) is returned as-is and NOT retried.
+int fbRequest(const char* method, const String& path, const String& body, String* out) {
+  const String url = firebaseUrl + profilePrefix() + path + ".json";
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (!fbClientReady) {
+      fbClient.setInsecure();   // same trust model as before (no cert pinning)
+      fbClientReady = true;
+    }
+    fbHttp.setReuse(true);      // keep the TLS socket open across requests
+    fbHttp.setTimeout(5000);
+    if (!fbHttp.begin(fbClient, url)) {
+      // begin() couldn't even set up — drop and retry once with a clean client.
+      fbResetConnection();
+      continue;
+    }
+
+    int code;
+    if (strcmp(method, "GET") == 0) {
+      code = fbHttp.GET();
+    } else {
+      fbHttp.addHeader("Content-Type", "application/json");
+      code = (strcmp(method, "PUT") == 0) ? fbHttp.PUT(body)
+                                          : fbHttp.sendRequest("PATCH", body);
+    }
+
+    if (code > 0) {
+      // Request completed at the HTTP layer (may still be 4xx/5xx).
+      if (out && code == 200) { *out = fbHttp.getString(); out->trim(); }
+      fbHttp.end();             // reuse=true -> finishes request, keeps socket
+      return code;
+    }
+
+    // Negative code = transport failure (likely a stale reused socket). Force a
+    // clean reconnect and try once more; if this was already the retry, give up.
+    fbResetConnection();
   }
-  http.end();
+  return -1;   // both attempts failed at the transport level
+}
+
+String fbGet(String path) {
+  String result = "error";
+  int code = fbRequest("GET", path, String(), &result);
+  if (code != 200) {
+    Serial.printf("fbGet failed %s code=%d\n", path.c_str(), code);
+    return "error";
+  }
   return result;
 }
 
 bool fbPut(String path, String jsonValue) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, firebaseUrl + profilePrefix() + path + ".json");
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);
-  int code = http.PUT(jsonValue);
-  http.end();
-  return (code == 200);
+  return fbRequest("PUT", path, jsonValue, nullptr) == 200;
 }
 
 // PATCH selected children without replacing siblings.
 bool fbPatch(String path, String jsonValue) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, firebaseUrl + profilePrefix() + path + ".json");
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);
-  int code = http.sendRequest("PATCH", jsonValue);
-  http.end();
-  return (code == 200);
+  return fbRequest("PATCH", path, jsonValue, nullptr) == 200;
 }
 
 // ── Push status back to Firebase ─────────────────────────────
