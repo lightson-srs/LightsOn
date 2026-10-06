@@ -4425,6 +4425,85 @@ function arSaveCache(profile, cache) {
   catch(e) { /* quota or disabled storage — report still works, just not cached */ }
 }
 
+// ── From/To date filter (client-side; no extra DB reads) ─────
+// Holds the data fetched for the current report open so the filter can
+// re-aggregate+re-render any sub-range of the 30-day window instantly.
+let arReportData = null;
+
+// YYYYMMDD key  <->  YYYY-MM-DD <input type=date> value.
+function arKeyToInputVal(key) { return key.slice(0,4) + '-' + key.slice(4,6) + '-' + key.slice(6,8); }
+function arInputValToKey(val) { return (val || '').replace(/-/g, ''); }
+
+// Set the From/To inputs' default range + min/max bounds to the fetched window.
+function arInitDateFilter(dayKeys) {
+  const from = document.getElementById('arFrom');
+  const to   = document.getElementById('arTo');
+  if (!from || !to || !dayKeys.length) return;
+  const minKey = dayKeys[0];                    // oldest in window (30 days ago)
+  const maxKey = dayKeys[dayKeys.length - 1];   // today
+  const minVal = arKeyToInputVal(minKey), maxVal = arKeyToInputVal(maxKey);
+  // Bound both inputs to the 30-day window so nothing outside it is selectable.
+  from.min = minVal; from.max = maxVal;
+  to.min   = minVal; to.max   = maxVal;
+  from.value = minVal;   // default: full window
+  to.value   = maxVal;
+}
+
+// Re-aggregate + re-render for the currently selected [from, to] range. Pure
+// client-side filter over the already-fetched data — issues NO DB reads.
+function arApplyDateFilter() {
+  if (!arReportData) return;
+  const { auditRaw, templates, roomNameById, dayKeys } = arReportData;
+
+  const fromEl = document.getElementById('arFrom');
+  const toEl   = document.getElementById('arTo');
+  let fromKey = fromEl && fromEl.value ? arInputValToKey(fromEl.value) : dayKeys[0];
+  let toKey   = toEl   && toEl.value   ? arInputValToKey(toEl.value)   : dayKeys[dayKeys.length - 1];
+  // Clamp to the fetched window and fix an inverted range (from > to).
+  const minKey = dayKeys[0], maxKey = dayKeys[dayKeys.length - 1];
+  if (fromKey < minKey) fromKey = minKey;
+  if (toKey   > maxKey) toKey   = maxKey;
+  if (fromKey > toKey) { const t = fromKey; fromKey = toKey; toKey = t; }
+
+  // Day keys that fall within the selected range (oldest→newest), preserving the
+  // report's existing per-day structure.
+  const rangeKeys = dayKeys.filter(k => k >= fromKey && k <= toKey);
+  const rangeKeySet = new Set(rangeKeys);
+
+  const perDay = {};
+  rangeKeys.forEach(k => { perDay[k] = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,system:0 }; });
+  const totals = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,system:0 };
+  const allEvents = [];
+
+  if (auditRaw && typeof auditRaw === 'object') {
+    Object.keys(auditRaw).forEach(dayKey => {
+      if (!rangeKeySet.has(dayKey)) return;      // outside the selected sub-range
+      const dayRecords = auditRaw[dayKey];
+      if (!dayRecords || typeof dayRecords !== 'object') return;
+      Object.keys(dayRecords).forEach(pushId => {
+        const rec = dayRecords[pushId];
+        if (!rec || !rec.c) return;
+        const cat = AUDIT_CATEGORY[rec.c] || 'system';
+        if (perDay[dayKey][cat] !== undefined) perDay[dayKey][cat]++;
+        if (totals[cat] !== undefined) totals[cat]++;
+        allEvents.push({ t: rec.t || 0, text: expandAuditRecord(rec, templates, roomNameById) });
+      });
+    });
+  }
+
+  arRenderSummary(totals);
+  arRenderTable(rangeKeys, perDay);
+  arRenderEvents(allEvents);
+  arRenderCharts(rangeKeys, perDay, totals);
+}
+
+// "Last 30 days" button — reset the inputs to the full fetched window.
+function arResetDateFilter() {
+  if (!arReportData) return;
+  arInitDateFilter(arReportData.dayKeys);
+  arApplyDateFilter();
+}
+
 async function openActivityReport() {
   const p = getActiveProfile();
   const m = document.getElementById('activityReportModal');
@@ -4482,35 +4561,15 @@ async function openActivityReport() {
     const roomNameById = {};
     (state.rooms || []).forEach(r => { roomNameById[r.id] = r.name || ('Room ' + r.id); });
 
-    // Aggregate per day and overall. Categories: create/update/delete/activate/
-    // deactivate/override. System events (GR/RF) are tracked separately as
-    // annotations, not counted in the activity totals.
-    const cats = ['create','update','delete','activate','deactivate','override'];
-    const perDay = {};
-    dayKeys.forEach(k => { perDay[k] = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,system:0 }; });
-    const totals = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,system:0 };
-    const allEvents = [];   // {t, text} for the recent-events list
+    // Stash everything the (client-side) date filter needs so changing the
+    // From/To range re-renders instantly with NO new DB reads — all 30 days are
+    // already in hand.
+    arReportData = { auditRaw, templates, roomNameById, dayKeys };
 
-    if (auditRaw && typeof auditRaw === 'object') {
-      Object.keys(auditRaw).forEach(dayKey => {
-        if (!dayKeySet.has(dayKey)) return;              // outside the 30-day window
-        const dayRecords = auditRaw[dayKey];
-        if (!dayRecords || typeof dayRecords !== 'object') return;
-        Object.keys(dayRecords).forEach(pushId => {
-          const rec = dayRecords[pushId];
-          if (!rec || !rec.c) return;
-          const cat = AUDIT_CATEGORY[rec.c] || 'system';
-          if (perDay[dayKey][cat] !== undefined) perDay[dayKey][cat]++;
-          if (totals[cat] !== undefined) totals[cat]++;
-          allEvents.push({ t: rec.t || 0, text: expandAuditRecord(rec, templates, roomNameById) });
-        });
-      });
-    }
-
-    arRenderSummary(totals);
-    arRenderTable(dayKeys, perDay);
-    arRenderEvents(allEvents);
-    arRenderCharts(dayKeys, perDay, totals);
+    // Initialise the From/To date inputs to the full 30-day window (bounded so
+    // the user can only pick within it), then render for that range.
+    arInitDateFilter(dayKeys);
+    arApplyDateFilter();
 
     // Retention: delete /audit days older than the keep window. Runs at most
     // ONCE PER DAY (not every open) and uses a SHALLOW key-only read — otherwise
@@ -7923,6 +7982,14 @@ function applyUpdate() {
       <div class="modal-body" id="activityReportBody" style="overflow:auto">
         <div id="arLoading" style="font-size:13px;color:var(--muted);padding:20px 4px">Loading activity…</div>
         <div id="arContent" style="display:none">
+          <!-- date filter (within the 30-day window; client-side, no new reads) -->
+          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px;font-size:12px;color:var(--muted)">
+            <span>From</span>
+            <input type="date" id="arFrom" class="settings-input" style="width:auto;padding:5px 8px" onchange="arApplyDateFilter()">
+            <span>To</span>
+            <input type="date" id="arTo" class="settings-input" style="width:auto;padding:5px 8px" onchange="arApplyDateFilter()">
+            <button class="test-btn" style="margin:0;padding:5px 10px" onclick="arResetDateFilter()">Last 30 days</button>
+          </div>
           <!-- summary strip -->
           <div id="arSummary" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px"></div>
           <!-- charts -->
