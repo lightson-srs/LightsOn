@@ -4396,6 +4396,35 @@ function arRecentDayKeys(n) {
   return keys;
 }
 
+// ── Incremental audit cache (Option 1) ───────────────────────
+// Reduces the report's read cost: a past day's /audit bucket is immutable, so
+// once fetched it never needs re-reading. Only the LIVE day (and the day that
+// was live when we last cached — it may have gained events after a mid-day
+// open) must be re-fetched. Cache is per profile in localStorage.
+//
+// Shape: { days: { "YYYYMMDD": {pushId: rec, ...}, ... }, asOfDayKey: "YYYYMMDD" }
+//   days       — fetched day-buckets, keyed by day
+//   asOfDayKey — the day key that was "today" at the last cache write; that day
+//                was incomplete when stored, so it is always re-fetched next time
+function arCacheKey(profile) {
+  const p = profile || getActiveProfile();
+  // Namespace by profile so sites sharing one DB don't cross-contaminate.
+  return 'auditCache_' + (p && p.id != null ? p.id : (p && p.dbUrl ? p.dbUrl : 'default'));
+}
+function arLoadCache(profile) {
+  try {
+    const raw = localStorage.getItem(arCacheKey(profile));
+    if (!raw) return { days:{}, asOfDayKey:null };
+    const c = JSON.parse(raw);
+    if (!c || typeof c !== 'object' || typeof c.days !== 'object') return { days:{}, asOfDayKey:null };
+    return { days: c.days || {}, asOfDayKey: c.asOfDayKey || null };
+  } catch(e) { return { days:{}, asOfDayKey:null }; }
+}
+function arSaveCache(profile, cache) {
+  try { localStorage.setItem(arCacheKey(profile), JSON.stringify(cache)); }
+  catch(e) { /* quota or disabled storage — report still works, just not cached */ }
+}
+
 async function openActivityReport() {
   const p = getActiveProfile();
   const m = document.getElementById('activityReportModal');
@@ -4410,18 +4439,48 @@ async function openActivityReport() {
     // Make sure the DB has the current templates for cross-device expansion.
     ensureAuditTemplates(p);   // not awaited — local AUDIT_TEMPLATES is the fallback
 
-    // ONE read of the whole /audit node (day-keyed, tiny per record), then
-    // filter to the last 30 days client-side — cheaper than 30 separate reads.
-    const [auditRaw, templatesRaw] = await Promise.all([
-      fbGetOrUndef('/audit', p),
-      fbGetOrUndef('/auditTemplates', p)
+    const dayKeys = arRecentDayKeys(30);
+    const dayKeySet = new Set(dayKeys);
+    const todayKey = auditDayKey(Date.now());
+
+    // Incremental fetch (Option 1): reuse cached immutable past days; only read
+    // the day-buckets that could have changed. The LIVE day is ALWAYS re-fetched
+    // (it's still being written to — a mid-day open must not freeze it), as is
+    // the day that was live at the last cache write (it may have gained events
+    // after that open), plus any in-window day missing from the cache.
+    const cache = arLoadCache(p);
+    const toFetch = new Set();
+    toFetch.add(todayKey);                         // always
+    if (cache.asOfDayKey) toFetch.add(cache.asOfDayKey);
+    dayKeys.forEach(k => { if (!cache.days[k]) toFetch.add(k); });
+
+    // Fetch the needed day-buckets in parallel (each tiny), plus templates.
+    const fetchKeys = [...toFetch].filter(k => dayKeySet.has(k) || k === todayKey);
+    const [templatesRaw, ...fetchedBuckets] = await Promise.all([
+      fbGetOrUndef('/auditTemplates', p),
+      ...fetchKeys.map(k => fbGetOrUndef(`/audit/${k}`, p))
     ]);
+
+    // Merge: start from cached days, overlay freshly fetched ones (a null fetch
+    // means that day now has no records — reflect that by clearing it).
+    const mergedDays = Object.assign({}, cache.days);
+    fetchKeys.forEach((k, i) => {
+      const bucket = fetchedBuckets[i];
+      if (bucket && typeof bucket === 'object') mergedDays[k] = bucket;
+      else delete mergedDays[k];                   // day emptied/absent remotely
+    });
+    // Drop anything outside the 30-day window so the cache can't grow forever.
+    Object.keys(mergedDays).forEach(k => { if (!dayKeySet.has(k)) delete mergedDays[k]; });
+
+    // Persist the refreshed cache; asOfDayKey = today so next open re-reads it.
+    arSaveCache(p, { days: mergedDays, asOfDayKey: todayKey });
+
+    // auditRaw now looks exactly like the old whole-node read, so the rest of
+    // the aggregation below is unchanged.
+    const auditRaw = mergedDays;
     const templates = (templatesRaw && typeof templatesRaw === 'object') ? templatesRaw : AUDIT_TEMPLATES;
     const roomNameById = {};
     (state.rooms || []).forEach(r => { roomNameById[r.id] = r.name || ('Room ' + r.id); });
-
-    const dayKeys = arRecentDayKeys(30);
-    const dayKeySet = new Set(dayKeys);
 
     // Aggregate per day and overall. Categories: create/update/delete/activate/
     // deactivate/override. System events (GR/RF) are tracked separately as
@@ -4453,9 +4512,10 @@ async function openActivityReport() {
     arRenderEvents(allEvents);
     arRenderCharts(dayKeys, perDay, totals);
 
-    // Retention: delete /audit days older than the keep window so the node
-    // never grows unbounded. Fire-and-forget; failure just leaves old data.
-    arRunRetention(p, auditRaw, 60);
+    // Retention: delete /audit days older than the keep window. Runs at most
+    // ONCE PER DAY (not every open) and uses a SHALLOW key-only read — otherwise
+    // it would re-read the whole /audit node and defeat the incremental cache.
+    arRunRetentionThrottled(p, 60);
 
     document.getElementById('arLoading').style.display = 'none';
     document.getElementById('arContent').style.display = '';
@@ -4562,18 +4622,39 @@ function arRenderCharts(dayKeys, perDay, totals) {
   }));
 }
 
-// Delete /audit day-buckets older than keepDays. Fire-and-forget per the audit
-// contract: a failed cleanup is harmless (old data just lingers).
-function arRunRetention(profile, auditRaw, keepDays) {
-  if (!auditRaw || typeof auditRaw !== 'object') return;
+// Delete /audit day-buckets older than keepDays. Runs at most ONCE PER DAY and
+// uses a SHALLOW (key-only) read, so it never re-downloads the whole /audit node
+// — that would defeat the incremental cache. The report's own fetch only sees
+// the last 30 days, so retention can't rely on it to find the 31–60-day-old
+// buckets; a shallow read returns just the day KEYS (tiny) to delete by.
+// Fire-and-forget per the audit contract: a failed cleanup is harmless.
+function arRunRetentionThrottled(profile, keepDays) {
+  const p = profile || getActiveProfile();
+  if (!p || !p.dbUrl) return;
+  const todayKey = auditDayKey(Date.now());
+  let lastRetentionDay = null;
+  try { lastRetentionDay = localStorage.getItem('auditRetentionDay_' + (p.id != null ? p.id : 'default')); } catch(e) {}
+  if (lastRetentionDay === todayKey) return;   // already ran today for this profile
+
   const cutoff = auditDayKey(Date.now() - keepDays * 86400000);
-  Object.keys(auditRaw).forEach(dayKey => {
-    if (/^\d{8}$/.test(dayKey) && dayKey < cutoff) {
-      try {
-        fetch(fbUrl(`/audit/${dayKey}`, profile), { method:'DELETE' }).catch(() => {});
-      } catch(e) { /* best-effort */ }
-    }
-  });
+  // Shallow read: ?shallow=true makes RTDB return {dayKey:true,...} — just keys,
+  // no record bodies — so this is a tiny read regardless of how much audit exists.
+  (async () => {
+    try {
+      const res = await fetch(fbUrl('/audit', p) + '?shallow=true&nc=' + Date.now(),
+        { cache:'no-store', headers:{ 'Accept':'application/json' } });
+      if (!res.ok) return;
+      const keys = await res.json();
+      if (keys && typeof keys === 'object') {
+        Object.keys(keys).forEach(dayKey => {
+          if (/^\d{8}$/.test(dayKey) && dayKey < cutoff) {
+            fetch(fbUrl(`/audit/${dayKey}`, p), { method:'DELETE' }).catch(() => {});
+          }
+        });
+      }
+      try { localStorage.setItem('auditRetentionDay_' + (p.id != null ? p.id : 'default'), todayKey); } catch(e) {}
+    } catch(e) { /* best-effort — retry on the next open */ }
+  })();
 }
 
 // Append one Sync V2 change and advance the revision.
