@@ -1,9 +1,10 @@
-const CACHE = 'roomctrl-fb-v36';
+const CACHE = 'roomctrl-fb-v37';
 const STATIC_ASSETS = [
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
-  './js/qrcode.min.js'
+  './js/qrcode.min.js',
+  './js/chart.umd.min.js'
 ];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC_ASSETS)));

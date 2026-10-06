@@ -368,6 +368,16 @@
     .license-expired-blocker .expired-contact { font-size: 12px; color: var(--muted); }
     .license-expired-blocker .expired-contact a { color: var(--accent); text-decoration: none; }
     #licenseModal { z-index: 10000; } /* must be above the expired blocker (z-9999) */
+    /* Activity report */
+    .ar-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    .ar-table th, .ar-table td { padding: 6px 8px; text-align: center; border-bottom: 1px solid var(--border, #2a2a2a); white-space: nowrap; }
+    .ar-table th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
+    .ar-table td:first-child, .ar-table th:first-child { text-align: left; }
+    .ar-table tr.ar-total td { font-weight: 700; border-top: 2px solid var(--border, #2a2a2a); border-bottom: none; }
+    .ar-chip { display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 78px;
+      padding: 8px 10px; border-radius: 10px; background: var(--card); border: 1px solid var(--border, #2a2a2a); }
+    .ar-chip .ar-chip-num { font-size: 18px; font-weight: 700; color: var(--accent); }
+    .ar-chip .ar-chip-lbl { font-size: 10px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .3px; }
   </style>
 </head>
 <body>
@@ -604,6 +614,13 @@
       <div class="settings-sub" style="padding:0 14px 8px">Normally the ESP32 does this automatically at midnight. Use this if a room is showing stale one-time slots that should already have been cleared (e.g. after a firmware update or an extended outage) — for every room, it drops today's one-time slots, promotes tomorrow's one-time slots into today, and keeps recurring slots as-is, then pushes the result to Firebase immediately.</div>
       <div class="settings-row">
         <button class="test-btn" style="margin:0" onclick="forceAllRoomsRollover()">Force slot rollover now</button>
+      </div>
+    </div>
+    <div class="settings-section license-exempt">
+      <div class="settings-title">Activity report</div>
+      <div class="settings-sub" style="padding:0 14px 8px">A 30-day history of product activity — slots created, updated, deleted, activated, and deactivated mid-session, plus manual overrides, shown day by day with charts. Data is read only when you open the report.</div>
+      <div class="settings-row">
+        <button class="test-btn" style="margin:0" onclick="openActivityReport()">📊 View 30-day activity report</button>
       </div>
     </div>
     <button class="save-btn" onclick="saveActiveProfile()">Save changes to this profile</button>
@@ -1478,6 +1495,7 @@ async function confirmBookingImport() {
     renderDashboard();
 
     bookingLastResult = { roomId: r.id, slotId: slot.id };
+    writeAudit('SC', { r: r.id, id: slot.id, f: start, o: end });
     document.getElementById('bkResultMsg').textContent =
       `${r.name} · ${start}–${end} · code ${code}` + (name ? ` · ${name}` : '');
     document.getElementById('bkWhatsAppBtn').style.display = phone ? '' : 'none';
@@ -2088,6 +2106,7 @@ async function saveSlotFromModal() {
     persist();
     renderDashboard();
     refreshTimelineIfVisible();
+    writeAudit('SU', { r: roomId, id: slotId, f: s, o: e });
     showToast('✓ Slot updated');
     if (paid && !recurring) maybeSendPaidConfirmationById(roomId, slotId, day);
     return;
@@ -2110,6 +2129,7 @@ async function saveSlotFromModal() {
   await pushRoom(savedRoomId - 1);
   renderDashboard();
   refreshTimelineIfVisible();
+  writeAudit('SC', { r: savedRoomId, id: newSlot.id, f: s, o: e });
   const codeMsg = !requireCode ? ' (auto)' : ` (code: ${slotCode})`;
   showToast('✓ One-time slot added' + codeMsg);
   if (paid) maybeSendPaidConfirmationById(savedRoomId, newSlot.id, savedDay);
@@ -2383,6 +2403,7 @@ async function activateSlot(roomId, slotIdx) {
   // existing Manual ON/OFF selection; the activated slot will take effect
   // when the operator explicitly returns the room to Auto.
   persist(); renderDashboard();
+  auditSlot('SA', r, localSlot);
   showToast('✓ Slot activated');
 }
 async function deactivateSlot(roomId, slotIdx) {
@@ -2399,6 +2420,7 @@ async function deactivateSlot(roomId, slotIdx) {
   const localIdx = (r.slots[0] || []).findIndex(slot => slot && slot.id === localSlot.id);
   if (localIdx >= 0) r.slots[0][localIdx] = { ...result.slot };
   persist(); renderDashboard();
+  auditSlot('SX', r, localSlot);
   showToast('✓ Slot deactivated');
 }
 
@@ -3298,6 +3320,12 @@ async function pwaFullRoomsRefresh(p, meta, reason) {
   renderDashboard();
   refreshTimelineIfVisible();
   addLog('ok', `Sync V2 full refresh (${reason || 'recovery'}) → ${Number((useMeta||{}).generation||0)}/${Number((useMeta||{}).revision||0)}`);
+  // Audit only MEANINGFUL full refreshes (a health signal), not routine
+  // first-load bootstraps — logging every page load would be noise and cost
+  // (per our design: capture full-refreshes, not reloads). A full refresh is a
+  // heavy /rooms download, so a cluster of RF in the report flags sync trouble.
+  const rsn = String(reason || '');
+  if (rsn && !/bootstrap/i.test(rsn)) writeAudit('RF', { why: rsn }, p);
   return true;
 }
 
@@ -4224,6 +4252,306 @@ function trimSyncV2Changes(profile, headRevision) {
   } catch(e) { /* ignore — cleanup is best-effort */ }
 }
 
+// ── Activity audit log ────────────────────────────────────────
+// A permanent, day-keyed record of product activity for the 30-day report in
+// Settings. Deliberately byte-frugal (we care about DB cost): each record is
+// just { t: timestamp, c: 2-char code, p: params }. The human-readable text
+// lives ONCE in /auditTemplates (seeded below) and is expanded at render time,
+// so we never repeat long strings across thousands of records.
+//
+// Record:  /audit/{YYYYMMDD}/{pushId} -> { t, c, p }
+//   c  event code (see AUDIT_TEMPLATES keys)
+//   p  only the variable bits: r=roomId, id=slotId, f=fromTime, o=toTime,
+//      n=generation, why=refresh reason. Room NAME is resolved from r at render
+//      time (not stored) so a rename never bloats records or shows stale names.
+//
+// Writes are a single tiny POST (push) and are fire-and-forget: auditing must
+// never delay or fail the real action, and a dropped audit write is acceptable
+// (the action still happened; only its history line is lost).
+const AUDIT_TEMPLATES = {
+  SC: 'Slot created — {rn} (room {r}), {f}–{o}',
+  SU: 'Slot updated — {rn} (room {r}), {f}–{o}',
+  SD: 'Slot deleted — {rn} (room {r}), {f}–{o}',
+  SA: 'Slot activated — {rn} (room {r}), {f}–{o}',
+  SX: 'Slot deactivated mid-session — {rn} (room {r}), {f}–{o}',
+  ON: 'Manual override ON — {rn} (room {r})',
+  OF: 'Manual override OFF — {rn} (room {r})',
+  GR: 'Daily generation reset ({n})',
+  RF: 'Full resync — {why}'
+};
+// Category each code rolls up into for the day-wise counts/charts.
+const AUDIT_CATEGORY = {
+  SC:'create', SU:'update', SD:'delete', SA:'activate', SX:'deactivate',
+  ON:'override', OF:'override', GR:'system', RF:'system'
+};
+
+// Local date key YYYYMMDD in the BOARD timezone, so audit days line up with the
+// site's day (and with syncV2GenerationToday), not the viewer's timezone.
+function auditDayKey(ts) {
+  const d = new Date((ts || Date.now()) + BOARD_UTC_OFFSET_MIN * 60000);
+  return String(d.getUTCFullYear()) + String(d.getUTCMonth()+1).padStart(2,'0') + String(d.getUTCDate()).padStart(2,'0');
+}
+
+// Fire-and-forget audit write. `params` carries only the variable fields.
+function writeAudit(code, params, profile) {
+  try {
+    const p = profile || getActiveProfile();
+    if (!p || !p.dbUrl) return;
+    if (!AUDIT_TEMPLATES[code]) return;              // unknown code — never write junk
+    const now = Date.now();
+    const rec = { t: now, c: code, p: params || {} };
+    // Direct silent POST (push) — not fbPatch — so a failed audit write never
+    // logs an error or flips the connection dot. Not awaited.
+    fetch(fbUrl(`/audit/${auditDayKey(now)}`, p), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(rec)
+    }).catch(() => {});
+  } catch(e) { /* auditing must never break the action */ }
+}
+
+// Convenience wrapper for slot events: pulls r/id/f/o out of a room + slot.
+function auditSlot(code, room, slot, profile) {
+  if (!room || !slot) return;
+  writeAudit(code, { r: room.id, id: slot.id || null, f: slot.s || null, o: slot.e || null }, profile);
+}
+
+// Seed /auditTemplates once per profile so the report can expand codes even on
+// a device that never wrote them. Cheap: one tiny read, and a write only if
+// missing or stale. Call lazily (e.g. first time the report opens).
+async function ensureAuditTemplates(profile) {
+  const p = profile || getActiveProfile();
+  if (!p || !p.dbUrl) return;
+  try {
+    const existing = await fbGetOrUndef('/auditTemplates', p);
+    // Re-seed only if absent or missing any current code (so added codes land).
+    const needsSeed = !existing || typeof existing !== 'object' ||
+      Object.keys(AUDIT_TEMPLATES).some(k => existing[k] !== AUDIT_TEMPLATES[k]);
+    if (needsSeed) await fbSet('/auditTemplates', AUDIT_TEMPLATES, p);
+  } catch(e) { /* non-fatal — report falls back to the local AUDIT_TEMPLATES */ }
+}
+
+// Expand a stored record into display text using a template map (DB or local).
+function expandAuditRecord(rec, templates, roomNameById) {
+  const tpl = (templates && templates[rec.c]) || AUDIT_TEMPLATES[rec.c] || rec.c;
+  const prm = rec.p || {};
+  const rn = (prm.r != null && roomNameById && roomNameById[prm.r]) ? roomNameById[prm.r] : ('Room ' + (prm.r != null ? prm.r : '?'));
+  return tpl.replace(/\{(\w+)\}/g, (m, key) => {
+    if (key === 'rn') return rn;
+    const v = prm[key];
+    return (v === undefined || v === null) ? '' : String(v);
+  }).replace(/\s*[–-]\s*$/, '').replace(/,\s*$/, '').trim();   // tidy trailing sep if f/o absent
+}
+
+// ── Activity report (Settings → Activity report) ──────────────
+let arChartInstances = [];   // Chart.js instances to destroy on close/reopen
+
+function activityReportBackdropClick(e) {
+  if (e.target && e.target.id === 'activityReportModal') closeActivityReport();
+}
+function closeActivityReport() {
+  arChartInstances.forEach(c => { try { c.destroy(); } catch(_){} });
+  arChartInstances = [];
+  const m = document.getElementById('activityReportModal');
+  if (m) m.classList.remove('show');
+}
+
+// Format a YYYYMMDD key as a short label (e.g. "Oct 4").
+function arDayLabel(key) {
+  const y = key.slice(0,4), mo = key.slice(4,6), d = key.slice(6,8);
+  const dt = new Date(Number(y), Number(mo)-1, Number(d));
+  return dt.toLocaleDateString(undefined, { month:'short', day:'numeric' });
+}
+
+// Build the last-N day keys (YYYYMMDD, board timezone), oldest→newest.
+function arRecentDayKeys(n) {
+  const keys = [];
+  for (let i = n - 1; i >= 0; i--) {
+    keys.push(auditDayKey(Date.now() - i * 86400000));
+  }
+  return keys;
+}
+
+async function openActivityReport() {
+  const p = getActiveProfile();
+  const m = document.getElementById('activityReportModal');
+  if (!m) return;
+  m.classList.add('show');
+  document.getElementById('arLoading').style.display = '';
+  document.getElementById('arContent').style.display = 'none';
+  document.getElementById('arError').style.display = 'none';
+  if (!p || !p.dbUrl) { arShowError('No active profile / Firebase URL.'); return; }
+
+  try {
+    // Make sure the DB has the current templates for cross-device expansion.
+    ensureAuditTemplates(p);   // not awaited — local AUDIT_TEMPLATES is the fallback
+
+    // ONE read of the whole /audit node (day-keyed, tiny per record), then
+    // filter to the last 30 days client-side — cheaper than 30 separate reads.
+    const [auditRaw, templatesRaw] = await Promise.all([
+      fbGetOrUndef('/audit', p),
+      fbGetOrUndef('/auditTemplates', p)
+    ]);
+    const templates = (templatesRaw && typeof templatesRaw === 'object') ? templatesRaw : AUDIT_TEMPLATES;
+    const roomNameById = {};
+    (state.rooms || []).forEach(r => { roomNameById[r.id] = r.name || ('Room ' + r.id); });
+
+    const dayKeys = arRecentDayKeys(30);
+    const dayKeySet = new Set(dayKeys);
+
+    // Aggregate per day and overall. Categories: create/update/delete/activate/
+    // deactivate/override. System events (GR/RF) are tracked separately as
+    // annotations, not counted in the activity totals.
+    const cats = ['create','update','delete','activate','deactivate','override'];
+    const perDay = {};
+    dayKeys.forEach(k => { perDay[k] = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,system:0 }; });
+    const totals = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,system:0 };
+    const allEvents = [];   // {t, text} for the recent-events list
+
+    if (auditRaw && typeof auditRaw === 'object') {
+      Object.keys(auditRaw).forEach(dayKey => {
+        if (!dayKeySet.has(dayKey)) return;              // outside the 30-day window
+        const dayRecords = auditRaw[dayKey];
+        if (!dayRecords || typeof dayRecords !== 'object') return;
+        Object.keys(dayRecords).forEach(pushId => {
+          const rec = dayRecords[pushId];
+          if (!rec || !rec.c) return;
+          const cat = AUDIT_CATEGORY[rec.c] || 'system';
+          if (perDay[dayKey][cat] !== undefined) perDay[dayKey][cat]++;
+          if (totals[cat] !== undefined) totals[cat]++;
+          allEvents.push({ t: rec.t || 0, text: expandAuditRecord(rec, templates, roomNameById) });
+        });
+      });
+    }
+
+    arRenderSummary(totals);
+    arRenderTable(dayKeys, perDay);
+    arRenderEvents(allEvents);
+    arRenderCharts(dayKeys, perDay, totals);
+
+    // Retention: delete /audit days older than the keep window so the node
+    // never grows unbounded. Fire-and-forget; failure just leaves old data.
+    arRunRetention(p, auditRaw, 60);
+
+    document.getElementById('arLoading').style.display = 'none';
+    document.getElementById('arContent').style.display = '';
+  } catch(e) {
+    arShowError('Could not load activity: ' + (e && e.message ? e.message : e));
+  }
+}
+
+function arShowError(msg) {
+  document.getElementById('arLoading').style.display = 'none';
+  document.getElementById('arContent').style.display = 'none';
+  const el = document.getElementById('arError');
+  el.style.display = ''; el.textContent = msg;
+}
+
+function arRenderSummary(totals) {
+  const chips = [
+    ['Created', totals.create], ['Updated', totals.update], ['Deleted', totals.delete],
+    ['Activated', totals.activate], ['Deactivated', totals.deactivate], ['Overrides', totals.override]
+  ];
+  document.getElementById('arSummary').innerHTML = chips.map(([lbl,n]) =>
+    `<div class="ar-chip"><span class="ar-chip-num">${n}</span><span class="ar-chip-lbl">${lbl}</span></div>`
+  ).join('');
+}
+
+function arRenderTable(dayKeys, perDay) {
+  const head = `<thead><tr><th>Date</th><th>Created</th><th>Updated</th><th>Deleted</th>
+    <th>Activated</th><th>Deactiv.</th><th>Override</th><th>Total</th></tr></thead>`;
+  const sum = { create:0,update:0,delete:0,activate:0,deactivate:0,override:0,total:0 };
+  // newest day first in the table
+  const rows = dayKeys.slice().reverse().map(k => {
+    const d = perDay[k];
+    const dayTotal = d.create+d.update+d.delete+d.activate+d.deactivate+d.override;
+    sum.create+=d.create; sum.update+=d.update; sum.delete+=d.delete;
+    sum.activate+=d.activate; sum.deactivate+=d.deactivate; sum.override+=d.override; sum.total+=dayTotal;
+    if (dayTotal === 0) return '';   // skip empty days to keep the table tight
+    return `<tr><td>${arDayLabel(k)}</td><td>${d.create}</td><td>${d.update}</td><td>${d.delete}</td>
+      <td>${d.activate}</td><td>${d.deactivate}</td><td>${d.override}</td><td>${dayTotal}</td></tr>`;
+  }).join('');
+  const totalRow = `<tr class="ar-total"><td>30-day total</td><td>${sum.create}</td><td>${sum.update}</td>
+    <td>${sum.delete}</td><td>${sum.activate}</td><td>${sum.deactivate}</td><td>${sum.override}</td><td>${sum.total}</td></tr>`;
+  const body = `<tbody>${rows || '<tr><td colspan="8" style="color:var(--muted)">No activity in the last 30 days</td></tr>'}${totalRow}</tbody>`;
+  document.getElementById('arTable').innerHTML = head + body;
+}
+
+function arRenderEvents(allEvents) {
+  allEvents.sort((a,b) => b.t - a.t);   // newest first
+  const recent = allEvents.slice(0, 40);
+  const el = document.getElementById('arEvents');
+  if (!recent.length) { el.innerHTML = '<span style="color:var(--muted)">No events</span>'; return; }
+  el.innerHTML = recent.map(ev => {
+    const d = new Date(ev.t);
+    const when = isNaN(d) ? '' : d.toLocaleString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+    return `<div><span style="color:var(--muted)">${when}</span> — ${arEscape(ev.text)}</div>`;
+  }).join('');
+}
+
+function arEscape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Charts via Chart.js if available; otherwise a graceful text note (the table
+// and summary still fully convey the data).
+function arRenderCharts(dayKeys, perDay, totals) {
+  arChartInstances.forEach(c => { try { c.destroy(); } catch(_){} });
+  arChartInstances = [];
+  const fallback = document.getElementById('arChartFallback');
+  if (typeof Chart === 'undefined') {
+    fallback.style.display = '';
+    fallback.textContent = 'Charts need the Chart.js library (offline or not loaded). The table below has the full breakdown.';
+    return;
+  }
+  fallback.style.display = 'none';
+  const labels = dayKeys.map(arDayLabel);
+  const col = { create:'#4caf50', update:'#2196f3', delete:'#f44336', activate:'#ff9800', deactivate:'#9c27b0', override:'#00bcd4' };
+  const series = cat => dayKeys.map(k => perDay[k][cat]);
+  const cats = ['create','update','delete','activate','deactivate','override'];
+
+  // Stacked bar — daily activity by type
+  arChartInstances.push(new Chart(document.getElementById('arBarChart'), {
+    type:'bar',
+    data:{ labels, datasets: cats.map(c => ({ label:c, data:series(c), backgroundColor:col[c], stack:'a' })) },
+    options:{ responsive:true, maintainAspectRatio:false,
+      scales:{ x:{ stacked:true, ticks:{ maxRotation:0, autoSkip:true } }, y:{ stacked:true, beginAtZero:true, ticks:{ precision:0 } } },
+      plugins:{ legend:{ labels:{ boxWidth:10, font:{ size:10 } } } } }
+  }));
+
+  // Line — total activity per day
+  const totalsPerDay = dayKeys.map(k => { const d = perDay[k]; return d.create+d.update+d.delete+d.activate+d.deactivate+d.override; });
+  arChartInstances.push(new Chart(document.getElementById('arLineChart'), {
+    type:'line',
+    data:{ labels, datasets:[{ label:'Total', data:totalsPerDay, borderColor:'#2196f3', backgroundColor:'rgba(33,150,243,.15)', fill:true, tension:.3, pointRadius:2 }] },
+    options:{ responsive:true, maintainAspectRatio:false,
+      scales:{ x:{ ticks:{ maxRotation:0, autoSkip:true } }, y:{ beginAtZero:true, ticks:{ precision:0 } } },
+      plugins:{ legend:{ display:false } } }
+  }));
+
+  // Donut — overall action breakdown
+  arChartInstances.push(new Chart(document.getElementById('arDonutChart'), {
+    type:'doughnut',
+    data:{ labels:cats, datasets:[{ data:cats.map(c => totals[c]), backgroundColor:cats.map(c => col[c]) }] },
+    options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ position:'right', labels:{ boxWidth:10, font:{ size:10 } } } } }
+  }));
+}
+
+// Delete /audit day-buckets older than keepDays. Fire-and-forget per the audit
+// contract: a failed cleanup is harmless (old data just lingers).
+function arRunRetention(profile, auditRaw, keepDays) {
+  if (!auditRaw || typeof auditRaw !== 'object') return;
+  const cutoff = auditDayKey(Date.now() - keepDays * 86400000);
+  Object.keys(auditRaw).forEach(dayKey => {
+    if (/^\d{8}$/.test(dayKey) && dayKey < cutoff) {
+      try {
+        fetch(fbUrl(`/audit/${dayKey}`, profile), { method:'DELETE' }).catch(() => {});
+      } catch(e) { /* best-effort */ }
+    }
+  });
+}
+
 // Append one Sync V2 change and advance the revision.
 //
 // NOTE on atomicity: Firebase RTDB's REST API only accepts the `If-Match`
@@ -4401,6 +4729,9 @@ async function resetDailySyncV2(profile, reason) {
         continue;
       }
       if (!writeRes.ok) throw new Error(await writeRes.text());
+      // Audit the generation reset — only the device that actually wrote it
+      // (not the "someone else already reset" short-circuit above) records GR.
+      writeAudit('GR', { n: generation, why: reason || 'midnight_rollover' }, p);
       return true;
     } catch(e) {
       if (attempt===maxAttempts-1) {
@@ -4524,6 +4855,13 @@ async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, p
   if (!canonical) {
     addLog('error', `room${roomId} slot ${slotId}: Sync V2 publish failed — change NOT applied, please try again`);
     return { ok:false, reason:'sync_write_failed' };
+  }
+  // Audit only DELETE here — it's the one unambiguous operation at this layer.
+  // 'update' covers activate/deactivate/edit alike, which we can't tell apart
+  // here, so those are audited at their own action sites (SA/SX/SU) to avoid
+  // double-counting. slotBucket 'slots' = today, 'slotsT' = tomorrow.
+  if (updatedSlot.deleted) {
+    writeAudit('SD', { r: roomId, id: slotId, f: updatedSlot.s || null, o: updatedSlot.e || null }, p);
   }
 
   // Publish succeeded. Mirror the SAME canonical record to /rooms so the two
@@ -5414,6 +5752,9 @@ async function setOverride(id, val) {
   if (ok) {
     overrideWriteTime[owKey(id, p)] = Date.now();
     addLog('ok', `room${id} override → ${val === true ? 'ON' : val === false ? 'OFF' : 'AUTO'}`);
+    // Audit: ON for manual-on; OFF for both manual-off and return-to-Auto
+    // (both end a manual-on state from the operator's point of view).
+    writeAudit(val === true ? 'ON' : 'OF', { r: id }, p);
   } else {
     // Roll back only the optimistic override display. Do not dirty the whole
     // room, because a later general push must never be allowed to write override.
@@ -7195,6 +7536,7 @@ function applyUpdate() {
 </script>
   <!-- QR library vendored locally (offline-first) — loaded async, does not block page render -->
   <script src="js/qrcode.min.js" defer></script>
+  <script src="js/chart.umd.min.js" defer></script>
 
 
   <!-- ── Recurring schedule modal ─────────────────────────────── -->
@@ -7458,6 +7800,44 @@ function applyUpdate() {
         <div class="modal-divider"></div>
         <button class="modal-save-btn" onclick="saveTemplateFromModal()">Save Template</button>
         <button class="modal-cancel-btn" onclick="closeTemplateModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Activity report modal (Settings → Activity report) ────── -->
+  <div class="modal-overlay" id="activityReportModal" onclick="activityReportBackdropClick(event)">
+    <div class="modal-box" style="max-width:860px;width:96vw;max-height:92vh;display:flex;flex-direction:column">
+      <div class="modal-header">
+        <span class="modal-title">30-Day Activity Report</span>
+        <button class="modal-close" onclick="closeActivityReport()">×</button>
+      </div>
+      <div class="modal-body" id="activityReportBody" style="overflow:auto">
+        <div id="arLoading" style="font-size:13px;color:var(--muted);padding:20px 4px">Loading activity…</div>
+        <div id="arContent" style="display:none">
+          <!-- summary strip -->
+          <div id="arSummary" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px"></div>
+          <!-- charts -->
+          <div style="margin-bottom:6px;font-size:12px;font-weight:600;color:var(--text)">Daily activity (stacked by type)</div>
+          <div style="position:relative;height:200px;margin-bottom:18px"><canvas id="arBarChart"></canvas></div>
+          <div style="display:flex;flex-wrap:wrap;gap:18px;margin-bottom:18px">
+            <div style="flex:1;min-width:220px">
+              <div style="margin-bottom:6px;font-size:12px;font-weight:600;color:var(--text)">Total activity trend</div>
+              <div style="position:relative;height:170px"><canvas id="arLineChart"></canvas></div>
+            </div>
+            <div style="flex:1;min-width:220px">
+              <div style="margin-bottom:6px;font-size:12px;font-weight:600;color:var(--text)">Action breakdown</div>
+              <div style="position:relative;height:170px"><canvas id="arDonutChart"></canvas></div>
+            </div>
+          </div>
+          <div id="arChartFallback" style="display:none;font-size:12px;color:var(--muted);margin-bottom:14px"></div>
+          <!-- day-wise table -->
+          <div style="margin-bottom:6px;font-size:12px;font-weight:600;color:var(--text)">Day-by-day</div>
+          <div style="overflow-x:auto"><table id="arTable" class="ar-table"></table></div>
+          <!-- recent events detail -->
+          <div style="margin:16px 0 6px;font-size:12px;font-weight:600;color:var(--text)">Recent events</div>
+          <div id="arEvents" style="font-size:12px;line-height:1.7;color:var(--text)"></div>
+        </div>
+        <div id="arError" style="display:none;font-size:13px;color:var(--red);padding:16px 4px"></div>
       </div>
     </div>
   </div>
