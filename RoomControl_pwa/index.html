@@ -805,7 +805,8 @@ function makeRecurDefId() {
 // gets one so activation can be matched by identity instead of array position —
 // the array reorders (recurring-first rematerialize, rollover) shift indices and
 // used to clobber/lose an activated slot's state. The id travels to Firebase as
-// an extra field (the ESP32 still reads slots by index and ignores it).
+// an extra field and the ESP32 (Sync V2 firmware) matches slots BY THIS id too
+// — findLocalSlotById()/findSlotFirebaseKey() — not by array index.
 function makeSlotId() {
   return 'sl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
