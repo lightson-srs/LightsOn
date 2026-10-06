@@ -4868,11 +4868,15 @@ async function updateSlotById(roomId, slotId, expectedSlotTs, changes, bucket, p
     addLog('error', `room${roomId} slot ${slotId}: Sync V2 publish failed — change NOT applied, please try again`);
     return { ok:false, reason:'sync_write_failed' };
   }
-  // Audit only DELETE here — it's the one unambiguous operation at this layer.
-  // 'update' covers activate/deactivate/edit alike, which we can't tell apart
-  // here, so those are audited at their own action sites (SA/SX/SU) to avoid
-  // double-counting. slotBucket 'slots' = today, 'slotsT' = tomorrow.
-  if (updatedSlot.deleted) {
+  // Audit only a slot that is being deleted RIGHT NOW — i.e. this call is what
+  // flips deleted false->true. Must NOT fire when the slot was ALREADY a
+  // tombstone (remoteSlot.deleted) and this call is some other op (activate/
+  // pay/edit): updatedSlot = {...remoteSlot, ...changes} keeps deleted:true from
+  // the spread, so without this guard every later touch of a soft-deleted slot
+  // re-emitted SD — one real delete showed up as several, inflating the report.
+  // 'update' still covers activate/deactivate/edit, which are audited at their
+  // own sites (SA/SX/SU). slotBucket 'slots' = today, 'slotsT' = tomorrow.
+  if (changes && changes.deleted === true && !remoteSlot.deleted) {
     writeAudit('SD', { r: roomId, id: slotId, f: updatedSlot.s || null, o: updatedSlot.e || null }, p);
   }
 
