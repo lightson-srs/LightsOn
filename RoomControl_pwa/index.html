@@ -1658,6 +1658,7 @@ async function deleteRecurringDef(defId) {
   const defSync = await publishRecurringDefSyncV2(r.id, d, 'delete', getActiveProfile());
   if (!defSync) { showToast('⚠️ Could not publish recurring delete sync'); return; }
   await pushRoom(r.id - 1);
+  writeAudit('RD', { r: r.id, id: d.id, f: d.s || null, o: d.e || null, d: formatDaySet(d.days) });
   if (recModalRoomId) { recClearForm(); renderRecDefList(); }
   renderDashboard();
   showToast('✓ Recurring slot deleted');
@@ -1726,6 +1727,8 @@ async function saveRecurringFromModal() {
     if (!syncedDef) throw new Error('Recurring definition sync failed');
     Object.assign(changedDef, syncedDef);
     await pushRoom(r.id - 1);
+    writeAudit(recurringOperation === 'update' ? 'RU' : 'RC',
+      { r: r.id, id: changedDef.id, f: changedDef.s || null, o: changedDef.e || null, d: formatDaySet(changedDef.days) });
     recClearForm();
     renderRecDefList();
     renderDashboard();
@@ -4289,13 +4292,21 @@ const AUDIT_TEMPLATES = {
   SX: 'Slot deactivated mid-session — {rn} (room {r}), {f}–{o}',
   ON: 'Manual override ON — {rn} (room {r})',
   OF: 'Manual override OFF — {rn} (room {r})',
+  RC: 'Recurring slot created — {rn} (room {r}), {f}–{o} [{d}]',
+  RU: 'Recurring slot updated — {rn} (room {r}), {f}–{o} [{d}]',
+  RD: 'Recurring slot deleted — {rn} (room {r}), {f}–{o} [{d}]',
   GR: 'Daily generation reset ({n})',
   RF: 'Full resync — {why}'
 };
-// Category each code rolls up into for the day-wise counts/charts.
+// Category each code rolls up into for the day-wise counts/charts. Recurring
+// create/update/delete fold into the same create/update/delete columns as
+// one-time slots — the report stays a single coherent create/update/delete view
+// rather than sprouting separate recurring columns.
 const AUDIT_CATEGORY = {
   SC:'create', SU:'update', SD:'delete', SA:'activate', SX:'deactivate',
-  ON:'override', OF:'override', GR:'system', RF:'system'
+  ON:'override', OF:'override',
+  RC:'create', RU:'update', RD:'delete',
+  GR:'system', RF:'system'
 };
 
 // Local date key YYYYMMDD in the BOARD timezone, so audit days line up with the
