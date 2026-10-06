@@ -2388,17 +2388,25 @@ async function activateSlot(roomId, slotIdx) {
   if (!requireLicense('activate a slot')) return;
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return;
-  const localSlot = (r.slots[0] || [])[slotIdx];
+  // Day-aware: the dashboard rows render from r.slots[state.schedDay] (Today=0,
+  // Tomorrow=1) and pass an index into THAT bucket. These functions used to be
+  // hardcoded to r.slots[0] + the 'slots' bucket, so activating/deactivating a
+  // TOMORROW slot indexed into today's array and wrote the wrong bucket —
+  // nothing happened / the tomorrow row never updated. Match the day-aware
+  // pattern the edit/delete actions already use.
+  const day = state.schedDay;
+  const bucket = day === 0 ? 'slots' : 'slotsT';
+  const localSlot = (r.slots[day] || [])[slotIdx];
   if (!localSlot) { showToast('Slot not found'); return; }
   // ignoreVersion: activation only toggles activatedAt; no other admin flow
   // competes for it, so re-read-then-write by id is enough — the slotTs gate
   // only caused false conflicts against the app's own writeback here.
   const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
     activatedAt: Date.now(), activatedBy: 'admin', attempts: 0, lockedUntil: null, expired: false
-  }, 'slots', null, { ignoreVersion: true });
+  }, bucket, null, { ignoreVersion: true });
   if (!result.ok) { showSlotUpdateError(result, 'activating'); return; }
-  const localIdx = (r.slots[0] || []).findIndex(slot => slot && slot.id === localSlot.id);
-  if (localIdx >= 0) r.slots[0][localIdx] = { ...result.slot };
+  const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === localSlot.id);
+  if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
   // Slot activation and room override are independent controls. Preserve any
   // existing Manual ON/OFF selection; the activated slot will take effect
   // when the operator explicitly returns the room to Auto.
@@ -2410,15 +2418,19 @@ async function deactivateSlot(roomId, slotIdx) {
   if (!requireLicense('deactivate a slot')) return;
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return;
-  const localSlot = (r.slots[0] || [])[slotIdx];
+  // Day-aware — see activateSlot. Was hardcoded to today (r.slots[0] + 'slots'),
+  // so tomorrow's deactivate silently failed.
+  const day = state.schedDay;
+  const bucket = day === 0 ? 'slots' : 'slotsT';
+  const localSlot = (r.slots[day] || [])[slotIdx];
   if (!localSlot) { showToast('Slot not found'); return; }
   // ignoreVersion: see activateSlot — deactivation only clears activatedAt.
   const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
     activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false
-  }, 'slots', null, { ignoreVersion: true });
+  }, bucket, null, { ignoreVersion: true });
   if (!result.ok) { showSlotUpdateError(result, 'deactivating'); return; }
-  const localIdx = (r.slots[0] || []).findIndex(slot => slot && slot.id === localSlot.id);
-  if (localIdx >= 0) r.slots[0][localIdx] = { ...result.slot };
+  const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === localSlot.id);
+  if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
   persist(); renderDashboard();
   auditSlot('SX', r, localSlot);
   showToast('✓ Slot deactivated');
