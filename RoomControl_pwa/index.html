@@ -2388,6 +2388,17 @@ function toMinsStr(t) {
 }
 
 // ── Slot activation ───────────────────────────────────────────
+// Re-entrancy guard: activate/deactivate are async and their button stays
+// tappable until renderDashboard() runs AFTER the await, so a fast double-tap
+// used to re-enter and write twice (worse here because ignoreVersion:true means
+// the second write isn't rejected by the slotTs lock) — producing a duplicate
+// Firebase write AND a duplicate SA/SX audit record. This set holds the actions
+// currently in flight, keyed by room+slot+action, so a second tap on the SAME
+// action+slot is ignored while the first is still running. Different slots or
+// the opposite action are NOT blocked. The key is ALWAYS removed in finally, so
+// no early return / error can leave a button permanently dead.
+const slotActionInFlight = new Set();
+
 async function activateSlot(roomId, slotIdx) {
   if (!requireLicense('activate a slot')) return;
   const r = state.rooms.find(room => room.id === roomId);
@@ -2402,21 +2413,28 @@ async function activateSlot(roomId, slotIdx) {
   const bucket = day === 0 ? 'slots' : 'slotsT';
   const localSlot = (r.slots[day] || [])[slotIdx];
   if (!localSlot) { showToast('Slot not found'); return; }
-  // ignoreVersion: activation only toggles activatedAt; no other admin flow
-  // competes for it, so re-read-then-write by id is enough — the slotTs gate
-  // only caused false conflicts against the app's own writeback here.
-  const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
-    activatedAt: Date.now(), activatedBy: 'admin', attempts: 0, lockedUntil: null, expired: false
-  }, bucket, null, { ignoreVersion: true });
-  if (!result.ok) { showSlotUpdateError(result, 'activating'); return; }
-  const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === localSlot.id);
-  if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
-  // Slot activation and room override are independent controls. Preserve any
-  // existing Manual ON/OFF selection; the activated slot will take effect
-  // when the operator explicitly returns the room to Auto.
-  persist(); renderDashboard();
-  auditSlot('SA', r, localSlot);
-  showToast('✓ Slot activated');
+  const guardKey = `act:${roomId}:${localSlot.id}`;
+  if (slotActionInFlight.has(guardKey)) return;   // a tap is already in flight
+  slotActionInFlight.add(guardKey);
+  try {
+    // ignoreVersion: activation only toggles activatedAt; no other admin flow
+    // competes for it, so re-read-then-write by id is enough — the slotTs gate
+    // only caused false conflicts against the app's own writeback here.
+    const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
+      activatedAt: Date.now(), activatedBy: 'admin', attempts: 0, lockedUntil: null, expired: false
+    }, bucket, null, { ignoreVersion: true });
+    if (!result.ok) { showSlotUpdateError(result, 'activating'); return; }
+    const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === localSlot.id);
+    if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
+    // Slot activation and room override are independent controls. Preserve any
+    // existing Manual ON/OFF selection; the activated slot will take effect
+    // when the operator explicitly returns the room to Auto.
+    persist(); renderDashboard();
+    auditSlot('SA', r, localSlot);
+    showToast('✓ Slot activated');
+  } finally {
+    slotActionInFlight.delete(guardKey);
+  }
 }
 async function deactivateSlot(roomId, slotIdx) {
   if (!requireLicense('deactivate a slot')) return;
@@ -2428,16 +2446,23 @@ async function deactivateSlot(roomId, slotIdx) {
   const bucket = day === 0 ? 'slots' : 'slotsT';
   const localSlot = (r.slots[day] || [])[slotIdx];
   if (!localSlot) { showToast('Slot not found'); return; }
-  // ignoreVersion: see activateSlot — deactivation only clears activatedAt.
-  const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
-    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false
-  }, bucket, null, { ignoreVersion: true });
-  if (!result.ok) { showSlotUpdateError(result, 'deactivating'); return; }
-  const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === localSlot.id);
-  if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
-  persist(); renderDashboard();
-  auditSlot('SX', r, localSlot);
-  showToast('✓ Slot deactivated');
+  const guardKey = `deact:${roomId}:${localSlot.id}`;
+  if (slotActionInFlight.has(guardKey)) return;   // a tap is already in flight
+  slotActionInFlight.add(guardKey);
+  try {
+    // ignoreVersion: see activateSlot — deactivation only clears activatedAt.
+    const result = await updateSlotById(roomId, localSlot.id, localSlot.slotTs, {
+      activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false
+    }, bucket, null, { ignoreVersion: true });
+    if (!result.ok) { showSlotUpdateError(result, 'deactivating'); return; }
+    const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === localSlot.id);
+    if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
+    persist(); renderDashboard();
+    auditSlot('SX', r, localSlot);
+    showToast('✓ Slot deactivated');
+  } finally {
+    slotActionInFlight.delete(guardKey);
+  }
 }
 
 // ── QR code ───────────────────────────────────────────────────
