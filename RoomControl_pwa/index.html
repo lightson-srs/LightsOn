@@ -1215,9 +1215,10 @@ function fillWhatsAppTemplate(template, data) {
 
 // Shared by the per-slot reminder button and the post-import result
 // screen — the one place that actually builds and opens a wa.me link.
-function sendSlotWhatsAppReminder(roomId, slotIdx) {
+function sendSlotWhatsAppReminder(roomId, slotRef) {
   const r = state.rooms.find(x => x.id === roomId);
-  const slot = r && r.slots[0] && r.slots[0][slotIdx];
+  // Id-resolved (same stale-index fix as the action buttons), day-aware.
+  const slot = r && resolveSlotByIdOrIdx(r, state.schedDay, slotRef);
   if (!slot || !slot.phone) { showToast('No phone number saved for this slot'); return; }
   sendSlotWhatsApp(r, slot);
 }
@@ -1939,14 +1940,18 @@ function openSlotModal(roomId, opts) {
 // Opens the same modal preloaded with an existing slot's details for editing.
 // Reuses the whole add-slot form; saveSlotFromModal() updates in place when
 // editingSlotIdx is set instead of pushing a new slot.
-function openSlotModalEdit(roomId, slotIdx) {
+function openSlotModalEdit(roomId, slotRef) {
   if (!requireLicense('edit a slot')) return;
   const r = state.rooms.find(x => x.id === roomId);
   if (!r) return;
-  const slot = (r.slots[state.schedDay] || [])[slotIdx];
+  // Id-resolved (dashboard passes slot.id). The resolver also accepts a numeric
+  // index, so the timeline caller (openSlotModalEdit(roomId, hitBar.origIdx))
+  // keeps working unchanged.
+  const slot = resolveSlotByIdOrIdx(r, state.schedDay, slotRef);
   if (!slot) { showToast('Slot not found'); return; }
 
-  editingSlotIdx = slotIdx; // UI-only position
+  const list = (r.slots[state.schedDay] || []);
+  editingSlotIdx = list.indexOf(slot); // UI-only position, derived from the resolved slot
   editingSlotId = slot.id;
   editingSlotTs = slot.slotTs;
   modalRoomId = roomId;
@@ -2199,12 +2204,12 @@ function payChoiceBackdropClick(e) {
 //        if no phone on file).
 //      – Update only:   mark paid + save, no message.
 //      – Cancel:        no change at all (stays unpaid).
-async function toggleSlotPaid(roomId, slotIdx) {
+async function toggleSlotPaid(roomId, slotRef) {
   if (!requireLicense('update payment status')) return;
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return;
   const day = state.schedDay;
-  const localSlot = (r.slots[day] || [])[slotIdx];
+  const localSlot = resolveSlotByIdOrIdx(r, day, slotRef);
   if (!localSlot) { showToast('Slot not found'); return; }
   const slotId = localSlot.id;
   const expectedSlotTs = localSlot.slotTs;
@@ -2322,12 +2327,12 @@ async function savePayModal() {
   closePayModal();
   await commitSlotPaidById(roomId, slotId, expectedSlotTs, day, { bookedBy: name, phone, sendConfirmation: true });
 }
-async function editSlotCode(roomId, slotIdx) {
+async function editSlotCode(roomId, slotRef) {
   if (!requireLicense('change a slot code')) return;
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return;
   const day = state.schedDay;
-  const localSlot = (r.slots[day] || [])[slotIdx];
+  const localSlot = resolveSlotByIdOrIdx(r, day, slotRef);
   if (!localSlot) { showToast('Slot not found'); return; }
   const entered = prompt(`Change activation code for ${r.name} ${localSlot.s}-${localSlot.e}
 
@@ -2387,6 +2392,21 @@ function toMinsStr(t) {
   const [h,m] = t.split(':').map(Number); return h*60+m;
 }
 
+// Resolve a slot in the CURRENT day bucket by its stable id. Row action buttons
+// now pass slot.id (not the array index) because a background Sync V2 apply can
+// re-index r.slots[day] (normalizeSlots rebuilds/filters the array) between the
+// moment the dashboard rendered and the moment the user taps — a stale array
+// INDEX then points at a DIFFERENT slot in the same room (the "deactivate room2
+// also hit a room1 sibling slot" bug). The stable id is immune to re-indexing.
+// Back-compat: if an old cached button still passed a numeric index, fall back
+// to index lookup so nothing breaks mid-upgrade.
+function resolveSlotByIdOrIdx(r, day, idOrIdx) {
+  const list = (r && r.slots && r.slots[day]) || [];
+  if (typeof idOrIdx === 'string') return list.find(sl => sl && sl.id === idOrIdx) || null;
+  if (typeof idOrIdx === 'number') return list[idOrIdx] || null;   // legacy cached HTML
+  return null;
+}
+
 // ── Slot activation ───────────────────────────────────────────
 // Re-entrancy guard: activate/deactivate are async and their button stays
 // tappable until renderDashboard() runs AFTER the await, so a fast double-tap
@@ -2399,19 +2419,17 @@ function toMinsStr(t) {
 // no early return / error can leave a button permanently dead.
 const slotActionInFlight = new Set();
 
-async function activateSlot(roomId, slotIdx) {
+async function activateSlot(roomId, slotRef) {
   if (!requireLicense('activate a slot')) return;
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return;
   // Day-aware: the dashboard rows render from r.slots[state.schedDay] (Today=0,
-  // Tomorrow=1) and pass an index into THAT bucket. These functions used to be
-  // hardcoded to r.slots[0] + the 'slots' bucket, so activating/deactivating a
-  // TOMORROW slot indexed into today's array and wrote the wrong bucket —
-  // nothing happened / the tomorrow row never updated. Match the day-aware
-  // pattern the edit/delete actions already use.
+  // Tomorrow=1). The row passes the slot's STABLE ID, resolved here — immune to
+  // a background Sync V2 apply re-indexing the array between render and tap
+  // (which previously made the index point at a different slot in the room).
   const day = state.schedDay;
   const bucket = day === 0 ? 'slots' : 'slotsT';
-  const localSlot = (r.slots[day] || [])[slotIdx];
+  const localSlot = resolveSlotByIdOrIdx(r, day, slotRef);
   if (!localSlot) { showToast('Slot not found'); return; }
   const guardKey = `act:${roomId}:${localSlot.id}`;
   if (slotActionInFlight.has(guardKey)) return;   // a tap is already in flight
@@ -2436,15 +2454,14 @@ async function activateSlot(roomId, slotIdx) {
     slotActionInFlight.delete(guardKey);
   }
 }
-async function deactivateSlot(roomId, slotIdx) {
+async function deactivateSlot(roomId, slotRef) {
   if (!requireLicense('deactivate a slot')) return;
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return;
-  // Day-aware — see activateSlot. Was hardcoded to today (r.slots[0] + 'slots'),
-  // so tomorrow's deactivate silently failed.
+  // Day-aware + id-resolved — see activateSlot.
   const day = state.schedDay;
   const bucket = day === 0 ? 'slots' : 'slotsT';
-  const localSlot = (r.slots[day] || [])[slotIdx];
+  const localSlot = resolveSlotByIdOrIdx(r, day, slotRef);
   if (!localSlot) { showToast('Slot not found'); return; }
   const guardKey = `deact:${roomId}:${localSlot.id}`;
   if (slotActionInFlight.has(guardKey)) return;   // a tap is already in flight
@@ -5834,11 +5851,11 @@ async function deleteSlotById(roomId, slotId, expectedSlotTs, day) {
   showToast('✓ Slot deleted');
   return true;
 }
-async function deleteSlot(roomId, slotIdx) {
+async function deleteSlot(roomId, slotRef) {
   const r = state.rooms.find(room => room.id === roomId);
   if (!r) return false;
   const day = state.schedDay;
-  const slot = (r.slots[day] || [])[slotIdx];
+  const slot = resolveSlotByIdOrIdx(r, day, slotRef);
   if (!slot) { showToast('Slot not found'); return false; }
   return deleteSlotById(roomId, slot.id, slot.slotTs, day);
 }
@@ -6367,24 +6384,24 @@ function renderRoomCard(r) {
             // isn't colour-coded per design). Tapping toggles s.paid and writes
             // through immediately (see toggleSlotPaid).
             const payChip = !s.recurring
-              ? `<span class="slot-pay-chip ${s.paid ? 'paid' : 'unpaid'}" onclick="toggleSlotPaid(${r.id},${i})" title="Tap to toggle paid / unpaid">${s.paid ? 'PAID' : 'UNPAID'}</span>`
+              ? `<span class="slot-pay-chip ${s.paid ? 'paid' : 'unpaid'}" onclick="toggleSlotPaid(${r.id},'${s.id}')" title="Tap to toggle paid / unpaid">${s.paid ? 'PAID' : 'UNPAID'}</span>`
               : '';
             return `<div class="slot-item" style="flex-wrap:wrap;gap:5px;border-left:4px solid ${payCol};padding-left:8px${isExpired ? ';opacity:0.5' : ''}">
               <div class="slot-dot" style="background:${isActive ? 'var(--green)' : isExpired ? 'var(--muted)' : isWaiting ? 'var(--amber)' : dotCol}"></div>
               <span class="slot-time">${s.s} – ${s.e}${partial ? `<span title="Partially booked hour" style="color:var(--amber);font-weight:700"> *</span>` : ''}</span>
               <span style="font-size:10px;padding:1px 6px;border-radius:10px;background:${badgeBg};color:${badgeCol}">${badgeTxt}</span>
               ${payChip}
-              ${s.code ? `<span class="slot-code" id="slotcode_${r.id}_${i}" onclick="editSlotCode(${r.id},${i})" title="Tap to change code" style="cursor:pointer">${s.code}</span>` : `<span style="font-size:11px;padding:2px 7px;border-radius:6px;background:rgba(64,192,128,0.15);color:var(--green);font-weight:600">Auto</span>`}
+              ${s.code ? `<span class="slot-code" id="slotcode_${r.id}_${i}" onclick="editSlotCode(${r.id},'${s.id}')" title="Tap to change code" style="cursor:pointer">${s.code}</span>` : `<span style="font-size:11px;padding:2px 7px;border-radius:6px;background:rgba(64,192,128,0.15);color:var(--green);font-weight:600">Auto</span>`}
               ${isActive   ? `<span class="slot-status active">✓ Active</span>` : ''}
               ${isWaiting  ? `<span class="slot-status waiting">⏳ Waiting</span>` : ''}
               ${isExpired  ? `<span class="slot-status expired">Expired</span>` : ''}
               ${isLocked   ? `<span class="slot-status locked">🔒 ${lockMins}min</span>` : ''}
               <div style="display:flex;gap:5px;margin-left:auto">
-                ${!isActive && !isLocked && !isExpired ? `<button class="slot-activate-btn" onclick="activateSlot(${r.id},${i})">Activate</button>` : ''}
-                ${isActive ? `<button class="slot-deactivate-btn" onclick="deactivateSlot(${r.id},${i})">Deactivate</button>` : ''}
-                ${s.phone ? `<button class="slot-activate-btn" style="border-color:var(--green);color:var(--green)" onclick="sendSlotWhatsAppReminder(${r.id},${i})" title="Send WhatsApp reminder to ${s.bookedBy || s.phone}">💬</button>` : ''}
-                <button class="slot-activate-btn" onclick="openSlotModalEdit(${r.id},${i})" title="Edit slot timings">Edit</button>
-                <button class="slot-del" onclick="deleteSlot(${r.id},${i})">×</button>
+                ${!isActive && !isLocked && !isExpired ? `<button class="slot-activate-btn" onclick="activateSlot(${r.id},'${s.id}')">Activate</button>` : ''}
+                ${isActive ? `<button class="slot-deactivate-btn" onclick="deactivateSlot(${r.id},'${s.id}')">Deactivate</button>` : ''}
+                ${s.phone ? `<button class="slot-activate-btn" style="border-color:var(--green);color:var(--green)" onclick="sendSlotWhatsAppReminder(${r.id},'${s.id}')" title="Send WhatsApp reminder to ${s.bookedBy || s.phone}">💬</button>` : ''}
+                <button class="slot-activate-btn" onclick="openSlotModalEdit(${r.id},'${s.id}')" title="Edit slot timings">Edit</button>
+                <button class="slot-del" onclick="deleteSlot(${r.id},'${s.id}')">×</button>
               </div>
             </div>`;}).join('')
         : `<div class="empty-msg">No slots yet</div>`;
