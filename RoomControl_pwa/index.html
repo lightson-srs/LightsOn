@@ -4334,6 +4334,7 @@ const AUDIT_TEMPLATES = {
   SX: 'Slot deactivated mid-session — {rn} (room {r}), {f}–{o}',
   ON: 'Manual override ON — {rn} (room {r})',
   OF: 'Manual override OFF — {rn} (room {r})',
+  OA: 'Override set to Auto — {rn} (room {r})',
   RC: 'Recurring slot created — {rn} (room {r}), {f}–{o} [{d}]',
   RU: 'Recurring slot updated — {rn} (room {r}), {f}–{o} [{d}]',
   RD: 'Recurring slot deleted — {rn} (room {r}), {f}–{o} [{d}]',
@@ -4346,7 +4347,7 @@ const AUDIT_TEMPLATES = {
 // rather than sprouting separate recurring columns.
 const AUDIT_CATEGORY = {
   SC:'create', SU:'update', SD:'delete', SA:'activate', SX:'deactivate',
-  ON:'override', OF:'override',
+  ON:'override', OF:'override', OA:'override',
   RC:'create', RU:'update', RD:'delete',
   GR:'system', RF:'system'
 };
@@ -5963,8 +5964,10 @@ async function setOverride(id, val) {
     overrideWriteTime[owKey(id, p)] = Date.now();
     addLog('ok', `room${id} override → ${val === true ? 'ON' : val === false ? 'OFF' : 'AUTO'}`);
     // Audit: ON for manual-on; OFF for both manual-off and return-to-Auto
-    // (both end a manual-on state from the operator's point of view).
-    writeAudit(val === true ? 'ON' : 'OF', { r: id }, p);
+    // Three distinct override states, three distinct audit codes: ON (manual
+    // on), OF (manual off), OA (back to Auto). Previously null/Auto collapsed
+    // into OF, so "returned to Auto" was indistinguishable from a manual-off.
+    writeAudit(val === true ? 'ON' : val === false ? 'OF' : 'OA', { r: id }, p);
   } else {
     // Roll back only the optimistic override display. Do not dirty the whole
     // room, because a later general push must never be allowed to write override.
@@ -5996,6 +5999,11 @@ async function allRooms(val) {
   const ok = await fbPatch('/', patch, p);
   if (ok) {
     state.rooms.forEach(r => { overrideWriteTime[owKey(r.id, p)] = Date.now(); });
+    // Audit the bulk change per room (same ON/OF/OA codes as setOverride), so
+    // "All ON/OFF/Auto" shows up in the report just like per-room overrides.
+    // Previously allRooms() recorded nothing at all.
+    const code = val === true ? 'ON' : val === false ? 'OF' : 'OA';
+    state.rooms.forEach(r => writeAudit(code, { r: r.id }, p));
     addLog('ok', `all rooms override → ${val === true ? 'ON' : val === false ? 'OFF' : 'AUTO'}`);
     showToast(val === true ? 'All ON' : val === false ? 'All OFF' : 'All Auto');
   } else {
