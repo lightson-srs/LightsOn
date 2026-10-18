@@ -5148,6 +5148,27 @@ async function pushRoom(idx, profile) {
   const remoteSlotsArr = normalizeSlots(existingSlotsRaw);
   const remoteById = new Map();
   remoteSlotsArr.forEach(sl => { if (sl && sl.id) remoteById.set(sl.id, sl); });
+  // TRUE raw Firebase child key for each remote slot, by id — WITHOUT compacting
+  // (so null holes left by deletes keep the real indices intact). The write
+  // phase below keys writeMap by these raw keys, not by the compacted finalSlots
+  // position. Previously the compacted position was written as the raw child key
+  // (slots/${i}); when /slots had a hole, that landed a slot's patch on a
+  // DIFFERENT slot's raw index — editing one slot silently overwrote a sibling
+  // (and, since activatedAt isn't in the patch, left the sibling's stale
+  // activation, i.e. "deactivating/editing one slot hit another"). rawMaxKey is
+  // used to place brand-new slots at a fresh key that can't collide with a hole.
+  const rawKeyById = new Map();
+  let rawMaxKey = -1;
+  if (existingSlotsRaw && typeof existingSlotsRaw === 'object') {
+    const entries = Array.isArray(existingSlotsRaw)
+      ? existingSlotsRaw.map((slot, index) => [String(index), slot])
+      : Object.entries(existingSlotsRaw);
+    entries.forEach(([key, slot]) => {
+      const n = parseInt(key, 10);
+      if (!isNaN(n) && n > rawMaxKey) rawMaxKey = n;
+      if (slot && typeof slot === 'object' && slot.id) rawKeyById.set(slot.id, key);
+    });
+  }
   const syncedSlotIds = new Set(Array.isArray(r._syncedSlotIds) ? r._syncedSlotIds : []);
 
   let slotConflict = false;
@@ -5353,21 +5374,42 @@ async function pushRoom(idx, profile) {
       JSON.stringify(patch[k]) === JSON.stringify(remote[k] ?? null));
   };
   const writeMap = {};
+  let nextNewKey = rawMaxKey + 1;          // fresh keys for brand-new slots start past the highest raw key
+  const claimedRawKeys = new Set();        // raw keys we are (re)writing with a surviving slot
   for (let i = 0; i < finalSlots.length; i++) {
-    if (patchMatchesRemote(slotPatches[i], remoteSlotsArr[i])) {
-      // Nothing but position matches what's already there — don't churn its
-      // slotTs or send it over the wire.
-      slotPatches[i].slotTs = remoteSlotsArr[i].slotTs;
-      finalSlots[i].slotTs = remoteSlotsArr[i].slotTs;
+    const sl = finalSlots[i];
+    const remoteSameId = (sl && sl.id) ? remoteById.get(sl.id) : null;
+    // Resolve the TRUE raw Firebase key for this slot: its existing key if it
+    // already lives in /slots (by id), else a fresh key that can't collide with
+    // any existing index or hole. This is the core of the fix — we never again
+    // address a slot by its compacted position (which skewed against raw holes).
+    const rawKey = (sl && sl.id && rawKeyById.has(sl.id)) ? rawKeyById.get(sl.id) : String(nextNewKey++);
+    claimedRawKeys.add(rawKey);
+    if (remoteSameId && patchMatchesRemote(slotPatches[i], remoteSameId)) {
+      // Byte-identical (bar slotTs) to the SAME-id remote slot — nothing to
+      // write; keep its existing slotTs so we don't churn it. (Compared by id,
+      // not by compacted position, so a hole can't match a slot to the wrong one.)
+      slotPatches[i].slotTs = remoteSameId.slotTs;
+      finalSlots[i].slotTs = remoteSameId.slotTs;
       continue;
     }
-    writeMap[i] = slotPatches[i];
+    writeMap[rawKey] = slotPatches[i];
   }
+  // Prune: null out every raw Firebase key whose slot is gone — a remote key we
+  // did NOT claim above AND whose id this device previously confirmed synced (a
+  // real deletion, not a foreign add we simply haven't adopted). Keyed by the
+  // TRUE raw key, not a compacted length, so it can never null a live slot that
+  // sits past the compacted end.
   if (existingSlotsRaw && typeof existingSlotsRaw === 'object') {
-    for (const key of Object.keys(existingSlotsRaw)) {
-      const ghostIdx = parseInt(key, 10);
-      if (!isNaN(ghostIdx) && ghostIdx >= finalSlots.length) writeMap[ghostIdx] = null;
-    }
+    const rawEntries = Array.isArray(existingSlotsRaw)
+      ? existingSlotsRaw.map((slot, index) => [String(index), slot])
+      : Object.entries(existingSlotsRaw);
+    rawEntries.forEach(([key, slot]) => {
+      if (claimedRawKeys.has(key)) return;                 // still in use — keep
+      if (slot && typeof slot === 'object' && slot.id && syncedSlotIds.has(slot.id) && !placedIds.has(slot.id)) {
+        writeMap[key] = null;                              // known-deleted slot — prune its real key
+      }
+    });
   }
   // One multi-path PATCH instead of one request per changed/pruned index —
   // Firebase already treats a PATCH body's keys as the children to
