@@ -2111,6 +2111,22 @@ async function saveSlotFromModal() {
 
     const localIdx = (r.slots[day] || []).findIndex(slot => slot && slot.id === slotId);
     if (localIdx >= 0) r.slots[day][localIdx] = { ...result.slot };
+    // A pure TIME change on an existing slot is NOT picked up by the ESP32's
+    // incremental slot delta: applyCanonicalSlotDelta() takes only activation/
+    // expiry/version for a slot it already holds and keeps the OLD s/e in RAM
+    // (deliberate, to avoid a stale /rooms overwrite). So the firmware keeps
+    // scheduling the old window — e.g. a no-code slot whose start was pushed to
+    // the future stays ON instead of switching off. Publishing ONE roomSnapshot
+    // change forces the firmware down refreshOneRoomFromLegacy() → re-read
+    // /rooms/roomN/slots → parseSlots() picks up the new times → applyState()
+    // corrects the relay. It's a single extra revision (one room re-read),
+    // consumed once; normal incremental Sync V2 resumes right after. Only fired
+    // when the time actually changed, so activations/pay/code edits are
+    // unaffected. Awaited but non-fatal — the slot edit already succeeded.
+    if (timeChanged) {
+      try { await publishRoomSnapshotSyncV2(r, getActiveProfile(), 'slot_time_edit'); }
+      catch(e) { addLog('error', 'roomSnapshot publish after time edit failed: ' + e.message); }
+    }
     closeSlotModal();
     persist();
     renderDashboard();
