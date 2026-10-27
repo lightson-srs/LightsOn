@@ -1,4 +1,4 @@
-const CACHE = 'roomctrl-fb-v48';
+const CACHE = 'roomctrl-fb-v49';
 const STATIC_ASSETS = [
   './manifest.json',
   './icons/icon-192.png',

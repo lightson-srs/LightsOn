@@ -3326,8 +3326,44 @@ async function fbGetOrUndef(path, profile) {
 let pwaSyncInFlight = false;
 let pwaControlPoll = null;
 
-function applyRemoteRoomSnapshot(roomId, remote) {
+// Merge a remote bucket onto a local one by id, taking remote's SCHEDULE fields
+// (times/code/etc.) but PRESERVING the fresher-by-slotTs local ACTIVATION
+// fields. Used only for the live roomSnapshot echo (preserveLocalActivation),
+// where /rooms can lag the activation this device just wrote through
+// updateSlotById → /slotRecords+/rooms. Without this, a roomSnapshot re-read of
+// /rooms wholesale-replaced local slots with a stale (pre-activation) copy, so a
+// just-activated slot flipped back to deactivated within one sync cycle — on
+// create AND time-edit, coded and non-coded alike.
+const SNAPSHOT_ACTIVATION_FIELDS = ['activatedAt','activatedBy','attempts','lockedUntil'];
+function mergeRemoteBucketPreservingActivation(localArr, remoteArr) {
+  const localById = new Map();
+  (localArr || []).forEach(sl => { if (sl && sl.id) localById.set(sl.id, sl); });
+  return (remoteArr || []).map(rem => {
+    if (!rem || !rem.id) return rem;
+    const loc = localById.get(rem.id);
+    if (!loc) return rem;   // slot we don't hold locally — take remote as-is
+    // Remote is strictly NEWER (another device/activate.html changed it since) →
+    // adopt remote wholesale, including its activation. Otherwise local is at
+    // least as fresh (e.g. the activation THIS device just set) → keep local's
+    // activation fields, but still take remote's schedule/content fields.
+    const remoteNewer = typeof rem.slotTs === 'number' && typeof loc.slotTs === 'number' && rem.slotTs > loc.slotTs;
+    if (remoteNewer) return rem;
+    const merged = { ...rem };   // remote schedule/content (s,e,code,days,date,...)
+    SNAPSHOT_ACTIVATION_FIELDS.forEach(f => { merged[f] = loc[f]; });   // keep local activation
+    merged.slotTs = loc.slotTs;  // keep local's version token (matches the kept activation)
+    return merged;
+  });
+}
+
+// opts.preserveLocalActivation:
+//   false/absent (DEFAULT) → authoritative REPLACE from /rooms. This is the
+//     behaviour every full-refresh / bootstrap / manual-Sync caller relies on
+//     and is UNCHANGED — /rooms is truth, there's no fresher local state.
+//   true → live roomSnapshot echo: MERGE by id, preserving fresher local
+//     activation (see mergeRemoteBucketPreservingActivation).
+function applyRemoteRoomSnapshot(roomId, remote, opts) {
   if (!remote || typeof remote !== 'object') return false;
+  const preserveActivation = !!(opts && opts.preserveLocalActivation);
   let room = state.rooms.find(r => r.id === roomId);
   if (!room) {
     room = { id:roomId, name:`Room ${roomId}`, override:null, relayPin:null, ledPin:null,
@@ -3351,8 +3387,15 @@ function applyRemoteRoomSnapshot(roomId, remote) {
   if (remote.lightOn !== undefined) room.lightOn = remote.lightOn;
   reconcileOverride(room, remote);
   room.slots = room.slots || {0:[],1:[]};
-  room.slots[0] = ensureSlotIds(normalizeSlots(remote.slots));
-  room.slots[1] = ensureSlotIds(normalizeSlots(remote.slotsT));
+  const remoteToday = normalizeSlots(remote.slots);
+  const remoteTomorrow = normalizeSlots(remote.slotsT);
+  if (preserveActivation) {
+    room.slots[0] = ensureSlotIds(mergeRemoteBucketPreservingActivation(room.slots[0], remoteToday));
+    room.slots[1] = ensureSlotIds(mergeRemoteBucketPreservingActivation(room.slots[1], remoteTomorrow));
+  } else {
+    room.slots[0] = ensureSlotIds(remoteToday);
+    room.slots[1] = ensureSlotIds(remoteTomorrow);
+  }
   room.recurringDefs = normalizeSlots(remote.recurring);
   room._syncedSlotIds = room.slots[0].map(sl => sl && sl.id).filter(Boolean);
   room._syncedRecurDefIds = room.recurringDefs.map(d => d && d.id).filter(Boolean);
@@ -3482,7 +3525,11 @@ async function applyPwaSyncV2Change(revision, change, p) {
   if (change.entity === 'roomSnapshot') {
     const remote = await fbGet(`/rooms/room${roomId}`, p);
     if (!isActiveProfile(p)) return 'abort';
-    return applyRemoteRoomSnapshot(roomId, remote);
+    // Live echo: /rooms may lag an activation this device just wrote, so MERGE
+    // and preserve the fresher local activation instead of wholesale-replacing
+    // it (which flipped a just-activated slot back to deactivated). Full-refresh
+    // callers below deliberately keep the default authoritative replace.
+    return applyRemoteRoomSnapshot(roomId, remote, { preserveLocalActivation: true });
   }
   return false;
 }
