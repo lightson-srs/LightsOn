@@ -2152,6 +2152,23 @@ async function saveSlotFromModal() {
   markRoomDirty(savedRoomId - 1);
   persist();
   await pushRoom(savedRoomId - 1);
+  // ROOT FIX for "no-code slot deactivates ~10s after creation": an auto-active
+  // (no-code) slot was activated ONLY in /rooms by pushRoom — its /slotRecords
+  // canonical was never written. A later slot-delta apply then read the
+  // activation-less canonical and nulled the fresh activation. Publish the
+  // canonical now so /slotRecords carries activatedAt, consistent with /rooms,
+  // exactly like the button-activation path (updateSlotById → publishSlotSyncV2)
+  // already does. Only for auto-active no-code slots — a coded slot starts
+  // inactive and gets its canonical when it's actually activated. Find the slot
+  // fresh (pushRoom may have re-stamped slotTs/version).
+  if (autoActivate) {
+    const freshSlot = (r.slots[savedDay] || []).find(sl => sl && sl.id === newSlot.id);
+    if (freshSlot) {
+      const bucketName = savedDay === 0 ? 'slots' : 'slotsT';
+      try { await publishSlotSyncV2(savedRoomId, bucketName, freshSlot, 'create', getActiveProfile()); }
+      catch(e) { addLog('error', 'canonical publish for auto-active slot failed: ' + e.message); }
+    }
+  }
   renderDashboard();
   refreshTimelineIfVisible();
   writeAudit('SC', { r: savedRoomId, id: newSlot.id, f: s, o: e });
@@ -3491,7 +3508,27 @@ async function applyPwaSyncV2Change(revision, change, p) {
     const CLEARABLE = ['activatedAt', 'activatedBy', 'lockedUntil'];
     const mergeExisting = c => {
       const m = { ...list[idx], ...c };
-      CLEARABLE.forEach(f => { if (!(f in c)) m[f] = null; });
+      // "Absent in canonical => cleared to null" correctly propagates a real
+      // DEACTIVATION (Firebase drops the null activatedAt, so the canonical has
+      // no key). BUT a no-code slot AUTO-ACTIVATED on create is written to
+      // /rooms by pushRoom and NOT to /slotRecords — so its canonical is absent
+      // or activation-less. A stale/older slot delta for that slot would then
+      // wrongly null the fresh local activation (the "no-code slot deactivates
+      // ~10s after lights on" bug). So only treat "absent => null" as
+      // authoritative when the canonical is at least as NEW as what we hold
+      // (version >=). If the canonical is OLDER than local, local's activation
+      // is fresher — keep it. (version is the per-record authority token;
+      // deletes are handled separately by the caller, so a real deactivation
+      // always arrives with a newer version and still clears correctly.)
+      const canonVer = Number(c && c.version);
+      const localVer = Number(list[idx] && list[idx].version);
+      const canonicalIsAuthoritative = !(Number.isFinite(canonVer) && Number.isFinite(localVer) && canonVer < localVer);
+      if (canonicalIsAuthoritative) {
+        CLEARABLE.forEach(f => { if (!(f in c)) m[f] = null; });
+      } else {
+        // Local is newer — preserve local activation fields rather than nulling.
+        CLEARABLE.forEach(f => { if (!(f in c)) m[f] = list[idx][f]; });
+      }
       m.slotTs = list[idx].slotTs;
       return m;
     };
