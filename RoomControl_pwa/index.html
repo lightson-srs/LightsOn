@@ -5863,8 +5863,20 @@ async function forceAllRoomsRollover() {
     rolloverRoomLocally(r);
   }
   persist();
+  // Every room must push successfully before the marker is written. The marker
+  // tells the ESP32 "today's rollover is done" and makes it skip its own — so
+  // writing it after a failed/conflicted push leaves that room's slots stale
+  // while the board believes they're clean (the marker-vs-data desync).
+  const failedRooms = [];
   for (const r of state.rooms) {
-    await pushRoom(r.id - 1, p);
+    const pushed = await pushRoom(r.id - 1, p);
+    if (!pushed) failedRooms.push(r.name || ('Room ' + r.id));
+  }
+  if (failedRooms.length > 0) {
+    renderDashboard();
+    showToast('⚠️ Rollover incomplete — ' + failedRooms.join(', ') + ' did not save. Marker NOT written; check connection and retry.');
+    addLog('error', 'Manual slot rollover incomplete — marker not written (' + failedRooms.join(', ') + ')');
+    return;
   }
   // Record it — this is what lets the ESP32 skip its own midnight
   // rollover today instead of redundantly re-running it (and resetting
@@ -7461,6 +7473,7 @@ function setConnStatus(ok) {
 // there is no separate heartbeat request any more.
 const CONTROLLER_STALE_MINUTES = 11; // > 2 missed 5-min heartbeats
 let controllerLastSeenMs = null;     // UTC ms of the last heartbeat, null = none seen
+let controllerStaleSlots = false;    // board reports stale-dated slots in a today bucket
 // The legacy text has no timezone, and the firmware is fixed to IST (+05:30).
 // It used to be parsed as the VIEWER's local time, so any viewer outside IST saw
 // a healthy board as hours stale — or, east of IST, a dead one as "online".
@@ -7480,6 +7493,9 @@ function applyControllerStatus(st) {
   if (st && typeof st.lastSeenEpoch === 'number' && st.lastSeenEpoch > 1e9) ms = st.lastSeenEpoch * 1000;
   else if (st && typeof st.lastSeen === 'string') ms = parseControllerTs(st.lastSeen);
   controllerLastSeenMs = ms;
+  // Board-reported desync: marker says "rolled over today" but a room's today
+  // bucket still holds a past-dated one-time slot (detect-only, ESP32 v6.12+).
+  controllerStaleSlots = !!(st && st.staleSlots === true);
   renderControllerStatus();
 }
 
@@ -7508,6 +7524,8 @@ function renderControllerStatus() {
     setCtrlBar(el, 'stale', mins >= 120
       ? `⚠️ Controller not responding — last seen ${Math.floor(mins / 60)} h ago`
       : `⚠️ Controller not responding — last seen ${mins} min ago`, true);
+  } else if (controllerStaleSlots) {
+    setCtrlBar(el, 'stale', '⚠️ Controller online, but today\'s slots look out of date — Settings → Slot maintenance → Force slot rollover', false);
   } else {
     setCtrlBar(el, 'online', '● Controller online', false);
   }
