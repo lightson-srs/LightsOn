@@ -92,6 +92,7 @@
     .slot-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--card2); border-radius: 8px; margin-bottom: 4px; font-size: 13px; }
     .slot-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
     .slot-time { flex: 1; }
+    .slot-name { font-size: 11px; color: var(--muted); line-height: 1.3; max-width: 150px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .slot-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 0 2px; }
     .slot-del:hover { color: var(--red); }
     .empty-msg { font-size: 13px; color: var(--muted); padding: 6px 0 10px; }
@@ -983,6 +984,12 @@ function slotPaymentHex(sl) {
 // OTHER field from still being extracted. Whatever the SMS actually
 // provides gets filled in; the rest is left for the user to type in
 // manually rather than blocked outright.
+// Escape user-entered text (booker names can come from the public request page)
+// before putting it into innerHTML templates or attribute values.
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -6550,7 +6557,10 @@ function renderRoomCard(r) {
               : '';
             return `<div class="slot-item" style="flex-wrap:wrap;gap:5px;border-left:4px solid ${payCol};padding-left:8px${isExpired ? ';opacity:0.5' : ''}">
               <div class="slot-dot" style="background:${isActive ? 'var(--green)' : isExpired ? 'var(--muted)' : isWaiting ? 'var(--amber)' : dotCol}"></div>
-              <span class="slot-time">${s.s} – ${s.e}${partial ? `<span title="Partially booked hour" style="color:var(--amber);font-weight:700"> *</span>` : ''}</span>
+              <div class="slot-time" style="min-width:0">
+                <span>${s.s} – ${s.e}${partial ? `<span title="Partially booked hour" style="color:var(--amber);font-weight:700"> *</span>` : ''}</span>
+                ${s.bookedBy ? `<div class="slot-name" title="${escapeHtml(s.bookedBy)}">${escapeHtml(s.bookedBy)}</div>` : ''}
+              </div>
               <span style="font-size:10px;padding:1px 6px;border-radius:10px;background:${badgeBg};color:${badgeCol}">${badgeTxt}</span>
               ${payChip}
               ${s.code ? `<span class="slot-code" id="slotcode_${r.id}_${i}" onclick="editSlotCode(${r.id},'${s.id}')" title="Tap to change code" style="cursor:pointer">${s.code}</span>` : `<span style="font-size:11px;padding:2px 7px;border-radius:6px;background:rgba(64,192,128,0.15);color:var(--green);font-weight:600">Auto</span>`}
@@ -6561,7 +6571,7 @@ function renderRoomCard(r) {
               <div style="display:flex;gap:5px;margin-left:auto">
                 ${!isActive && !isLocked && !isExpired ? `<button class="slot-activate-btn" onclick="activateSlot(${r.id},'${s.id}')">Activate</button>` : ''}
                 ${isActive ? `<button class="slot-deactivate-btn" onclick="deactivateSlot(${r.id},'${s.id}')">Deactivate</button>` : ''}
-                ${s.phone ? `<button class="slot-activate-btn" style="border-color:var(--green);color:var(--green)" onclick="sendSlotWhatsAppReminder(${r.id},'${s.id}')" title="Send WhatsApp reminder to ${s.bookedBy || s.phone}">💬</button>` : ''}
+                ${s.phone ? `<button class="slot-activate-btn" style="border-color:var(--green);color:var(--green)" onclick="sendSlotWhatsAppReminder(${r.id},'${s.id}')" title="Send WhatsApp reminder to ${escapeHtml(s.bookedBy || s.phone)}">💬</button>` : ''}
                 <button class="slot-activate-btn" onclick="openSlotModalEdit(${r.id},'${s.id}')" title="Edit slot timings">Edit</button>
                 <button class="slot-del" onclick="deleteSlot(${r.id},'${s.id}')">×</button>
               </div>
