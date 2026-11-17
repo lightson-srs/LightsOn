@@ -6,6 +6,12 @@
  *             LittleFS (bundled with modern ESP32 board packages),
  *             WiFi, HTTPClient, WiFiClientSecure (all built-in)
  *
+ *  v6.15 — A roomSnapshot / full /rooms re-read now takes each slot's ACTIVATION from
+ *  whichever of /rooms or the canonical /slotRecords record has the newer version
+ *  (same rule as the PWA's snapshot merge), so a /rooms copy that lost activatedAt
+ *  can no longer switch an Active slot off. Pairs with the PWA pushRoom fix that
+ *  stops it deleting those fields from /rooms.
+ *
  *  v6.14 — Diagnostics (observation-only): RAM ring of the last 20 relay changes/boots
  *  with a reason tag (sched/ovr/delta/legacy/slots/rollov/other/boot), reported as
  *  /status/diag on the heartbeat PATCH (immediately after an unexpected switch-off).
@@ -1241,6 +1247,53 @@ bool validateSlotsJsonForRefresh(const String &json) {
   return sawValidSlotObject;
 }
 
+// Same rule the PWA applies when it merges a /rooms snapshot
+// (mergeRemoteBucketPreservingActivation): schedule/content fields come from
+// /rooms, but ACTIVATION comes from whichever store holds the NEWER version of
+// that slot. /rooms can lag or lack the activation (a PWA write once replaced the
+// slot object and dropped it), while the canonical /slotRecords record - written
+// first by every activate/deactivate/create - carries it. Without this the board
+// re-read bare /rooms on a roomSnapshot and switched an Active slot off while the
+// PWA, which prefers its newer local state, still showed Active.
+//
+// Matched strictly by slot id; a slot with no id, no canonical record, or a
+// canonical version that is not NEWER is left exactly as /rooms gave it. One extra
+// read of the room's today bucket; any read problem leaves /rooms untouched.
+void overlayNewerCanonicalActivation(int roomIdx) {
+  if (roomIdx < 0 || roomIdx >= roomCount || rooms[roomIdx].slotCount == 0) return;
+  String raw = fbGet("/slotRecords/room" + String(roomIdx + 1) + "/today");
+  if (raw == "error" || raw == "null" || raw.length() < 5 || raw.length() > 24000) return;
+  if (raw[0] != '{' || findMatchingClose(raw, 0) != (int)raw.length() - 1) return; // truncated
+  for (int j = 0; j < rooms[roomIdx].slotCount; j++) {
+    Slot &sl = rooms[roomIdx].slots[j];
+    if (sl.id[0] == '\0') continue;
+    String key = "\"" + String(sl.id) + "\":{";
+    int p = raw.indexOf(key);
+    if (p < 0) continue;
+    int open = p + key.length() - 1;
+    int close = findMatchingClose(raw, open);
+    if (close < 0) continue;
+    String rec = raw.substring(open, close + 1);
+    if (rec.indexOf("\"deleted\":true") >= 0) continue;   // removals arrive as deltas
+    long recVersion = extractRawField(rec, "version").toInt();
+    if (recVersion <= 0 || recVersion <= sl.version) continue; // not newer — /rooms stands
+    bool recActivated = rec.indexOf("\"activatedAt\":") >= 0 && rec.indexOf("\"activatedAt\":null") < 0;
+    // An UNVERSIONED /rooms slot (version 0: legacy data, or one whose fields a
+    // write stripped) that /rooms still shows Active is never CLEARED by a canonical
+    // record - that record may be an old activation-less leftover (the case the
+    // v6.13 stale guard exists for). The overlay may only RESTORE activation there.
+    if (!recActivated && sl.activated && sl.version <= 0) continue;
+    if (recActivated != sl.activated) {
+      Serial.printf("Sync V2: room %d slot %s activation %s from newer canonical (v%ld > v%ld)\n",
+        roomIdx + 1, sl.id, recActivated ? "restored" : "cleared", recVersion, sl.version);
+    }
+    sl.activated = recActivated;
+    sl.expired   = rec.indexOf("\"expired\":true") >= 0;
+    sl.version   = recVersion;
+    extractRawField(rec, "slotTs").toCharArray(sl.slotTs, sizeof(sl.slotTs));
+  }
+}
+
 // Room-level fallback for create/copy snapshots and missing canonical records.
 bool refreshOneRoomFromLegacy(int roomIdx) {
   if (roomIdx < 0 || roomIdx >= roomCount) return false;
@@ -1253,6 +1306,7 @@ bool refreshOneRoomFromLegacy(int roomIdx) {
   if (raw == "null") raw = "[]";
   diagWhy = "legacy";
   parseSlots(roomIdx, raw);
+  overlayNewerCanonicalActivation(roomIdx);   // activation = newer of /rooms vs canonical
   applyState(roomIdx);
   Serial.printf("Sync V2: room %d refreshed from /rooms fallback (%d slots)\n",
     roomIdx + 1, rooms[roomIdx].slotCount);

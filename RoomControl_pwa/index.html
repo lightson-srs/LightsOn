@@ -5517,10 +5517,22 @@ async function pushRoom(idx, profile) {
   // since that's the equivalence every PATCH here already relies on.
   const patchMatchesRemote = (patch, remote) => {
     if (!remote) return false;
+    // patch[k] ?? null too: a no-code slot has code === undefined locally (the key
+    // is absent after a Firebase round-trip) while the remote side reads as null.
+    // undefined !== null made such slots NEVER "match", so every pushRoom rewrote
+    // every no-code slot (and, before the field-level write, wiped its activation).
     return Object.keys(patch).every(k => k === 'slotTs' ||
-      JSON.stringify(patch[k]) === JSON.stringify(remote[k] ?? null));
+      JSON.stringify(patch[k] ?? null) === JSON.stringify(remote[k] ?? null));
   };
-  const writeMap = {};
+  const writeMap = {};                     // whole-object writes: brand-new slots + prunes (null)
+  // Field-level writes for slots that ALREADY exist in /rooms. A multi-path PATCH
+  // SETS (replaces) the value at each path it names, so writing the whole patch
+  // object at slots/<k> deleted every field the patch deliberately omits —
+  // activatedAt/activatedBy/attempts/lockedUntil/version — from /rooms while the
+  // local copy (and /slotRecords) still showed the slot Active. The board's next
+  // roomSnapshot re-read of /rooms then saw an un-activated slot and switched the
+  // room off. Naming each changed field as its own path keeps untouched fields.
+  const fieldWrites = {};
   let nextNewKey = rawMaxKey + 1;          // fresh keys for brand-new slots start past the highest raw key
   const claimedRawKeys = new Set();        // raw keys we are (re)writing with a surviving slot
   for (let i = 0; i < finalSlots.length; i++) {
@@ -5540,7 +5552,18 @@ async function pushRoom(idx, profile) {
       finalSlots[i].slotTs = remoteSameId.slotTs;
       continue;
     }
-    writeMap[rawKey] = slotPatches[i];
+    if (remoteSameId && rawKeyById.has(sl.id)) {
+      // Existing slot: write only the fields that actually differ (null removes a
+      // field, same as PATCH semantics), and always its slotTs token.
+      const pt = slotPatches[i];
+      Object.keys(pt).forEach(k => {
+        if (k === 'slotTs' || JSON.stringify(pt[k] ?? null) !== JSON.stringify(remoteSameId[k] ?? null)) {
+          fieldWrites[`slots/${rawKey}/${k}`] = (pt[k] === undefined) ? null : pt[k];
+        }
+      });
+    } else {
+      writeMap[rawKey] = slotPatches[i];
+    }
   }
   // Prune: null out every raw Firebase key whose slot is gone — a remote key we
   // did NOT claim above AND whose id this device previously confirmed synced (a
@@ -5568,8 +5591,9 @@ async function pushRoom(idx, profile) {
   // marker bump per push is enough for request.html/activate.html to invalidate
   // their cache — the double bump was a redundant /config write every save).
   let roomsMarkerBumped = false;
-  if (Object.keys(writeMap).length > 0) {
-    ok = await writeRoomSlots(r.id, writeMap, p) && ok;
+  if (Object.keys(writeMap).length > 0 || Object.keys(fieldWrites).length > 0) {
+    ok = await writeRoomSlots(r.id, writeMap, p,
+      Object.keys(fieldWrites).length > 0 ? fieldWrites : undefined) && ok;
     roomsMarkerBumped = true;
   }
   r.slots[0] = finalSlots;
